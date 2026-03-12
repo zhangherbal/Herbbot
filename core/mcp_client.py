@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import AsyncExitStack  # 必须是 contextlib
+from contextlib import AsyncExitStack 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -10,10 +10,7 @@ class MCPManager:
         self.exit_stack = None
 
     async def connect_to_server(self, command: str, args: list = None):
-        """
-        连接 MCP 服务器
-        """
-        # 强制纠错：防止在 main.py 调用时漏写了 "npx"
+
         if isinstance(command, list):
             real_args = command
             real_command = "npx"
@@ -32,14 +29,12 @@ class MCPManager:
                 env=None
             )
 
-            # 使用 contextlib 中的 AsyncExitStack
+
             self.exit_stack = AsyncExitStack()
 
-            # 建立通信隧道
             client_lowlevel = await self.exit_stack.enter_async_context(stdio_client(server_params))
             read, write = client_lowlevel
 
-            # 创建并初始化会话
             self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
             await self.session.initialize()
 
