@@ -12,37 +12,29 @@ class MyBot(botpy.Client):
         super().__init__(*args, **kwargs)
         self.skill_manager = SkillManager()
         self.mcp_manager = MCPManager()
-        # 初始化时不传 agent，等 on_ready 时注入回调后再初始化
+
         self.agent = None
         self.history_cache = {}
 
     async def on_ready(self):
         print(f"机器人「{self.robot.name}」已上线！")
 
-        # 1. 优化后的发送回调函数
         async def send_reminder_msg(target_id, text):
-            """
-            target_id: 可能是频道ID，也可能是用户的 openid
-            """
+
             try:
-                # 逻辑判断：如果 ID 特别长（通常 openid 长度 > 20），则尝试走 C2C 私聊推送
+              
                 if len(target_id) > 20:
-                    # 个人私聊主动推送接口
-                    # msg_type=0 代表文本，openid 是用户的唯一标识
+
                     await self.api.post_c2c_message(openid=target_id, msg_type=0, content=text)
                     print(f"[主动推送] 闹钟提醒已发送至个人私聊: {target_id}")
                 else:
-                    # 频道消息主动推送接口
                     await self.api.post_message(channel_id=target_id, content=text)
                     print(f"[主动推送] 闹钟提醒已发送至频道: {target_id}")
             except Exception as e:
-                # 打印具体错误：如果是 5000x 错误码，说明你没有主动推送权限
                 print(f"[!] 主动推送失败，ID: {target_id}，错误: {e}")
 
-        # 2. 正式初始化 AgentLoop
         self.agent = AgentLoop(self.skill_manager, self.mcp_manager, send_message_func=send_reminder_msg)
 
-        # 启动 MCP 服务
         try:
             await self.mcp_manager.connect_to_server("npx", ["@modelcontextprotocol/server-everything"])
             print("[+] 联网服务加载完毕！")
@@ -52,9 +44,7 @@ class MyBot(botpy.Client):
     async def _handle_all_messages(self, message, source_type):
         content = message.content.strip()
 
-        # 获取用户唯一标识
         user_id = getattr(message.author, 'user_openid', None) or getattr(message.author, 'id', 'unknown_user')
-        # 获取消息来源 ID（频道 ID 或 C2C 会话 ID），用于倒计时回调
         channel_id = getattr(message, 'channel_id', None) or getattr(message, 'id', None)
 
         print(f"\n[!!! 捕获到{source_type}消息 !!!] 用户ID: {user_id} 内容: {content}")
@@ -68,8 +58,7 @@ class MyBot(botpy.Client):
         try:
             print(f"--- Herbbot 正在通过 DeepSeek 思考... ---")
 
-            # 3. 传入 user_id 和 channel_id
-            # user_id 用于长期记忆，channel_id 用于倒计时结束后知道往哪发消息
+
             reply, updated_history = await self.agent.run(
                 user_input=content,
                 history=self.history_cache[user_id],
@@ -87,7 +76,6 @@ class MyBot(botpy.Client):
             traceback.print_exc()
             await message.reply(content="咱就是说，大脑突然短路了，稍等下哈~")
 
-    # --- 接口订阅 ---
     async def on_direct_message_create(self, message: DirectMessage):
         await self._handle_all_messages(message, "【频道私聊】")
 
