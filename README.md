@@ -7,3 +7,4 @@
 1:可以加入RAG，家乡科普功能。 <br>
 2:MCP + langchain实现资料搜集等功能 <br>
 3:skills:微博热搜功能(非爬虫版)
+<img width="1046" height="842" alt="image" src="https://github.com/user-attachments/assets/6bf76b5a-bb07-4501-a9aa-1106f65d8d53" />
