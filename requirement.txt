@@ -1,0 +1,4 @@
+openai
+qq-botpy
+mcp
+python-dotenv

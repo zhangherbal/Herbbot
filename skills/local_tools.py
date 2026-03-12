@@ -1,0 +1,258 @@
+import datetime
+import requests
+import urllib.request
+import gzip
+from bs4 import BeautifulSoup
+import time
+import random
+def get_current_time():
+    """获取当前系统时间"""
+    return f"现在是：{datetime.datetime.now().strftime('%H:%M:%S')}"
+
+def daily_quote():
+    """获取今日励志（或毒舌）语录"""
+    return "咱就是说，早起真的需要勇气。"
+
+
+def get_weibo_hot_search():
+    """
+    基于网页爬取逻辑的微博热搜查询
+    """
+    print('************** Herb 正在爬取微博热搜 **************')
+
+    # 1. 配置请求头 (使用你代码中的配置)
+    header = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh-Hans;q=0.9',
+        # 注意：如果爬不到数据，请在这里填入你浏览器里的真实 Cookie
+        'Cookie': '这里填入你的Cookie'
+    }
+    url = 'https://s.weibo.com/top/summary'
+
+    try:
+        # 2. 发送请求 (urllib 逻辑)
+        request = urllib.request.Request(url, headers=header)
+        response = urllib.request.urlopen(request, timeout=10)
+
+        # 处理 Gzip 压缩
+        if response.info().get('Content-Encoding') == 'gzip':
+            compressed_data = response.read()
+            decompressed_data = gzip.decompress(compressed_data)
+            html = decompressed_data.decode('utf-8')
+        else:
+            html = response.read().decode('utf-8')
+
+        # 3. 解析网页 (BeautifulSoup 逻辑)
+        soup = BeautifulSoup(html, 'lxml')
+        # 选择器逻辑：定位热搜标题和热度
+        urls_title = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > a')
+        hotness = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > span')
+
+        if not urls_title:
+            return "热搜包围网太厚了，Herb 没钻进去。可能是 Cookie 过期了或者被微博防火墙挡住了。"
+
+        news_results = []
+        # 只取前 15 条，避免回复太长被 QQ 截断
+        for i in range(min(len(urls_title), 16)):
+            title = urls_title[i].get_text()
+            # 过滤掉顶部的推荐/置顶条目 (通常没有热度数值)
+            if i == 0:
+                continue  # 跳过置顶，从第1名开始
+
+            # 获取热度 (第i项标题对应第i-1项热度)
+            hot = hotness[i - 1].get_text() if (i - 1) < len(hotness) else "TOP"
+            news_results.append(f"{len(news_results) + 1}. {title} (热度:{hot})")
+
+        # 4. 格式化输出
+        get_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        content = "【Herb 实时爬取：微博热搜】\n" + "\n".join(news_results)
+        content += f"\n\n更新时间：{get_time}\n看完这些，我还是回竞技场 Rush B 吧。"
+
+        return content
+
+    except Exception as e:
+        return f"爬取热搜时发生了意外（可能是网线被猫叼走了）：{str(e)}"
+
+def set_reminder(minutes: int, task: str):
+    """
+    设置一个倒计时提醒
+    """
+    # 这个函数返回的消息会立刻发给用户
+    return f"收到。倒计时 {minutes} 分钟：【{task}】。开始计时了，到点我在群里吼你。别到时候 Rush B 没力气！"
+def get_weather(city: str):
+    try:
+        # 使用 j1 获取 JSON 数据
+        url = f"https://wttr.in/{city}?format=j1&lang=zh"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # --- 1. 今天的情况 ---
+            curr = data['current_condition'][0]
+            today = data['weather'][0]
+
+            # --- 2. 明天的情况 ---
+            tomorrow = data['weather'][1]
+            t_desc = tomorrow['hourly'][4]['lang_zh'][0]['value']  # 取中午前后的描述
+            t_max = tomorrow['maxtempC']
+            t_min = tomorrow['mintempC']
+
+            # --- 3. 趋势分析 (未来几小时) ---
+            hourly_next = today['hourly'][1]
+            chance_rain = hourly_next['chanceofrain']
+
+            res = (
+                f"【{city}天气深度汇报】\n"
+                f"● 当前：{curr['lang_zh'][0]['value']} {curr['temp_C']}℃ (体感 {curr['FeelsLikeC']}℃)\n"
+                f"● 今日波动：{today['mintempC']}℃ ~ {today['maxtempC']}℃\n"
+                f"● 短期趋势：未来几小时有【{hourly_next['lang_zh'][0]['value']}】，降水概率 {chance_rain}%\n"
+                f"-------------------\n"
+                f"● 明天预报：{t_desc}，气温 {t_min}℃ ~ {t_max}℃\n"
+            )
+
+            # 性格化建议
+            if int(chance_rain) > 50:
+                res += "⚠️ 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
+            elif int(t_max) > 30:
+                res += "🔥 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
+            else:
+                res += "✅ 天气还可以，适合下楼吃顿好的补补手感。"
+
+            return res
+        return f"找不到 {city} 的地图包（数据），你确定这地方在地球上？"
+    except Exception as e:
+        return f"天气模块寄了，报错原因: {str(e)}"
+
+def simulate_case_opening(case_name: str = "武器箱"):
+
+    skins = {
+        "金": [
+            "★ 蝴蝶刀 | 渐变大理石 (崭新出厂)",
+            "★ 爪子刀 | 多普勒 (蓝宝石)",
+            "★ 运动手套 | 迈阿密风云 (略有磨损)",
+            "★ M9 刺刀 | 传说 (久经沙场)",
+            "★ 蝴蝶刀  | 传说 (崭新出厂)"
+        ],
+        "红": [
+            "AWP | 永恒之枪 (崭新出厂)",
+            "AK-47 | 火蛇 (久经沙场)",
+            "M4A1-S | 骑士 (崭新出厂)",
+            "M4A4 | 咆哮 (略有磨损)",
+            "AK-47 | 野荷 (久经沙场)"
+        ],
+        "粉": [
+            "AWP | 闪电打击 (崭新出厂)",
+            "USP-S | 黑色莲花 (崭新出厂)",
+            "Desert Eagle | 红色代码 (略有磨损)",
+            "AK-47 | 霓虹革命 (久经沙场)"
+        ],
+        "紫": [
+            "Glock-18 | 摩登时代 (略有磨损)",
+            "MAC-10 | 霓虹骑士 (崭新出厂)",
+            "FAMAS | 元素轮廓 (久经沙场)",
+            "Galil AR | 火箭冰棒 (崭新出厂)"
+        ],
+        "蓝": [
+            "P250 | 翼手龙 (久经沙场)",
+            "MP9 | 粘性物 (战痕累累)",
+            "SSG 08 | 边境线 (略有磨损)",
+            "Tec-9 | 竹林 (久经沙场)",
+            "五七 | 耍酷 (战痕累累)"
+            ]
+        }
+
+    r = random.random()
+
+            # 概率判定 (参考官方概率)
+    if r < 0.0026:
+        grade = "金"
+        suffix = "！！！卧槽！张皓博看了直接原地退役！这把刀够你吃一年猪脚饭了！"
+    elif r < 0.0064:
+        grade = "红"
+        suffix = "隐秘级！红色大货！兄弟你这手气，不去打职业可惜了。"
+    elif r < 0.032:
+        grade = "粉"
+        suffix = "保密级。可以啊，这波没亏，这枪拿手里还挺帅。"
+    elif r < 0.15:
+        grade = "紫"
+        suffix = "受限级。紫色心情，也就那样吧，打竞技凑合用。"
+    else:
+        grade = "蓝"
+        suffix = "军规级。蓝天白云，标准的保底。听哥一句话，这行水太深，你把握不住。"
+
+    item = random.choice(skins[grade])
+
+    # 随机加上“StatTrak™”（暗金）属性
+    is_stattrak = random.random() < 0.1
+    prefix = "StatTrak™ " if is_stattrak else ""
+
+    return f"【Herb 模拟开箱：{case_name}】\n物品：{prefix}{item}\n品质：{grade}色\n点评：{suffix}"
+
+    # 记得在映射表和 Schema 里同步更新
+
+    # 技能映射表
+LOCAL_SKILLS_MAP = {
+    "get_current_time": get_current_time,
+    "daily_quote": daily_quote,
+    "get_weather": get_weather,
+    "get_weibo_hot_search": get_weibo_hot_search,
+    "simulate_case_opening": simulate_case_opening,
+}
+
+# OpenAI 工具描述格式
+SKILL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "获取当前的精确时间"
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "daily_quote",
+            "description": "获取今日的一句话语录"
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询指定城市的实时天气情况",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名称，如：北京、上海、哈尔滨"
+                    }
+                },
+                "required": ["city"] # 标记 city 为必填项
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weibo_hot_search",
+            "description": "返回微博热搜，这个世界今天有什么好玩的事情发生吗"
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "simulate_case_opening",
+            "description": "模拟CSGO开箱"
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": "计时器"
+        }
+    }
+]
