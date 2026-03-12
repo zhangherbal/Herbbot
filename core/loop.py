@@ -9,11 +9,9 @@ class AgentLoop:
         self.client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
         self.skills = skill_manager
         self.mcp = mcp_manager
-        # 这个 send_message_func 就是从 main.py 传进来的适配好 C2C 和频道的发送函数
         self.send_msg_func = send_message_func
 
     async def run(self, user_input, history, user_id, channel_id, max_steps=5):
-        # 1. 整合工具
         mcp_schemas = await self.mcp.get_tool_schemas() if self.mcp else []
         all_tools = self.skills.get_schemas() + mcp_schemas
 
@@ -22,7 +20,6 @@ class AgentLoop:
         step = 0
         while step < max_steps:
             step += 1
-            # 2. 请求大模型
             response = self.client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
@@ -36,7 +33,6 @@ class AgentLoop:
             if not curr_message.tool_calls:
                 return curr_message.content, messages
 
-            # 3. 并发执行工具调用
             tasks = []
             tool_call_info = []
 
@@ -46,19 +42,12 @@ class AgentLoop:
 
                 print(f"[*] 正在调用工具: {name} | 参数: {args}")
 
-                # --- 倒计时特殊处理 ---
                 if name == "set_reminder":
                     mins = args.get("minutes", 1)
                     task_name = args.get("task", "闹钟")
-
-                    # 【核心修改】判断推送目标
-                    # 如果是私聊(C2C)，ID通常很长(openid)，此时应把 user_id 传给计时器
-                    # 如果是频道，则使用 channel_id
                     target_id = user_id if (user_id and len(user_id) > 20) else channel_id
 
-                    # 启动后台计时器
                     asyncio.create_task(self._reminder_timer(mins, task_name, target_id))
-                # ---------------------
 
                 tasks.append(self._execute_single_tool(name, args, user_id))
                 tool_call_info.append(tool_call)
@@ -78,18 +67,14 @@ class AgentLoop:
     async def _execute_single_tool(self, name, args, user_id):
         try:
             if name in self.skills.skills:
-                # 统一调用 SkillManager 的 execute
                 return self.skills.execute(name, args, user_id)
             else:
                 return await self.mcp.call_tool(name, args)
         except Exception as e:
             return f"错误: {str(e)}"
 
-    # --- 计时器私有方法 ---
     async def _reminder_timer(self, minutes, task, target_id):
-        """
-        后台等待并在时间到达时调用 main.py 的回调函数
-        """
+
         try:
             print(f"[*] 闹钟已启动：{minutes} 分钟后提醒 {task}")
             await asyncio.sleep(int(minutes) * 60)
@@ -101,7 +86,7 @@ class AgentLoop:
                     f"你定的任务：『{task}』\n"
                     f"赶紧去干活，别让哥在这儿干等！"
                 )
-                # 调用 main.py 传进来的 send_reminder_msg
+
                 await self.send_msg_func(target_id, reminder_text)
                 print(f"[*] 闹钟提醒已成功推送至 ID: {target_id}")
         except Exception as e:
