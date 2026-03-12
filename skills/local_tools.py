@@ -15,12 +15,10 @@ def daily_quote():
 
 
 def get_weibo_hot_search():
-    """
-    基于网页爬取逻辑的微博热搜查询
-    """
+
     print('************** Herb 正在爬取微博热搜 **************')
 
-    # 1. 配置请求头 (使用你代码中的配置)
+
     header = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -31,11 +29,10 @@ def get_weibo_hot_search():
     url = 'https://s.weibo.com/top/summary'
 
     try:
-        # 2. 发送请求 (urllib 逻辑)
+
         request = urllib.request.Request(url, headers=header)
         response = urllib.request.urlopen(request, timeout=10)
 
-        # 处理 Gzip 压缩
         if response.info().get('Content-Encoding') == 'gzip':
             compressed_data = response.read()
             decompressed_data = gzip.decompress(compressed_data)
@@ -43,9 +40,7 @@ def get_weibo_hot_search():
         else:
             html = response.read().decode('utf-8')
 
-        # 3. 解析网页 (BeautifulSoup 逻辑)
         soup = BeautifulSoup(html, 'lxml')
-        # 选择器逻辑：定位热搜标题和热度
         urls_title = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > a')
         hotness = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > span')
 
@@ -53,18 +48,13 @@ def get_weibo_hot_search():
             return "热搜包围网太厚了，Herb 没钻进去。可能是 Cookie 过期了或者被微博防火墙挡住了。"
 
         news_results = []
-        # 只取前 15 条，避免回复太长被 QQ 截断
         for i in range(min(len(urls_title), 16)):
             title = urls_title[i].get_text()
-            # 过滤掉顶部的推荐/置顶条目 (通常没有热度数值)
             if i == 0:
-                continue  # 跳过置顶，从第1名开始
-
-            # 获取热度 (第i项标题对应第i-1项热度)
+                
             hot = hotness[i - 1].get_text() if (i - 1) < len(hotness) else "TOP"
             news_results.append(f"{len(news_results) + 1}. {title} (热度:{hot})")
 
-        # 4. 格式化输出
         get_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
         content = "【Herb 实时爬取：微博热搜】\n" + "\n".join(news_results)
         content += f"\n\n更新时间：{get_time}\n看完这些，我还是回竞技场 Rush B 吧。"
@@ -75,31 +65,26 @@ def get_weibo_hot_search():
         return f"爬取热搜时发生了意外（可能是网线被猫叼走了）：{str(e)}"
 
 def set_reminder(minutes: int, task: str):
-    """
-    设置一个倒计时提醒
-    """
+
     # 这个函数返回的消息会立刻发给用户
     return f"收到。倒计时 {minutes} 分钟：【{task}】。开始计时了，到点我在群里吼你。别到时候 Rush B 没力气！"
 def get_weather(city: str):
     try:
-        # 使用 j1 获取 JSON 数据
+
         url = f"https://wttr.in/{city}?format=j1&lang=zh"
         response = requests.get(url, timeout=10)
 
         if response.status_code == 200:
             data = response.json()
 
-            # --- 1. 今天的情况 ---
             curr = data['current_condition'][0]
             today = data['weather'][0]
 
-            # --- 2. 明天的情况 ---
             tomorrow = data['weather'][1]
             t_desc = tomorrow['hourly'][4]['lang_zh'][0]['value']  # 取中午前后的描述
             t_max = tomorrow['maxtempC']
             t_min = tomorrow['mintempC']
 
-            # --- 3. 趋势分析 (未来几小时) ---
             hourly_next = today['hourly'][1]
             chance_rain = hourly_next['chanceofrain']
 
@@ -112,13 +97,12 @@ def get_weather(city: str):
                 f"● 明天预报：{t_desc}，气温 {t_min}℃ ~ {t_max}℃\n"
             )
 
-            # 性格化建议
             if int(chance_rain) > 50:
-                res += "⚠️ 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
+                res += " 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
             elif int(t_max) > 30:
-                res += "🔥 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
+                res += " 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
             else:
-                res += "✅ 天气还可以，适合下楼吃顿好的补补手感。"
+                res += " 天气还可以，适合下楼吃顿好的补补手感。"
 
             return res
         return f"找不到 {city} 的地图包（数据），你确定这地方在地球上？"
@@ -184,15 +168,12 @@ def simulate_case_opening(case_name: str = "武器箱"):
 
     item = random.choice(skins[grade])
 
-    # 随机加上“StatTrak™”（暗金）属性
     is_stattrak = random.random() < 0.1
     prefix = "StatTrak™ " if is_stattrak else ""
 
     return f"【Herb 模拟开箱：{case_name}】\n物品：{prefix}{item}\n品质：{grade}色\n点评：{suffix}"
 
-    # 记得在映射表和 Schema 里同步更新
 
-    # 技能映射表
 LOCAL_SKILLS_MAP = {
     "get_current_time": get_current_time,
     "daily_quote": daily_quote,
@@ -201,7 +182,7 @@ LOCAL_SKILLS_MAP = {
     "simulate_case_opening": simulate_case_opening,
 }
 
-# OpenAI 工具描述格式
+
 SKILL_SCHEMAS = [
     {
         "type": "function",
