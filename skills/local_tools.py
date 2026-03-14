@@ -4,6 +4,7 @@ import urllib.request
 import gzip
 from bs4 import BeautifulSoup
 import time
+import re
 import random
 def get_current_time():
     """获取当前系统时间"""
@@ -15,7 +16,9 @@ def daily_quote():
 
 
 def get_weibo_hot_search():
-
+    """
+    基于网页爬取逻辑的微博热搜查询
+    """
     print('************** Herb 正在爬取微博热搜 **************')
 
 
@@ -23,7 +26,7 @@ def get_weibo_hot_search():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh-Hans;q=0.9',
-        # 注意：如果爬不到数据，请在这里填入你浏览器里的真实 Cookie
+
         'Cookie': '这里填入你的Cookie'
     }
     url = 'https://s.weibo.com/top/summary'
@@ -33,6 +36,7 @@ def get_weibo_hot_search():
         request = urllib.request.Request(url, headers=header)
         response = urllib.request.urlopen(request, timeout=10)
 
+
         if response.info().get('Content-Encoding') == 'gzip':
             compressed_data = response.read()
             decompressed_data = gzip.decompress(compressed_data)
@@ -40,7 +44,9 @@ def get_weibo_hot_search():
         else:
             html = response.read().decode('utf-8')
 
+
         soup = BeautifulSoup(html, 'lxml')
+
         urls_title = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > a')
         hotness = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > span')
 
@@ -48,10 +54,14 @@ def get_weibo_hot_search():
             return "热搜包围网太厚了，Herb 没钻进去。可能是 Cookie 过期了或者被微博防火墙挡住了。"
 
         news_results = []
+
         for i in range(min(len(urls_title), 16)):
             title = urls_title[i].get_text()
+
             if i == 0:
-                
+                continue  
+
+
             hot = hotness[i - 1].get_text() if (i - 1) < len(hotness) else "TOP"
             news_results.append(f"{len(news_results) + 1}. {title} (热度:{hot})")
 
@@ -64,10 +74,34 @@ def get_weibo_hot_search():
     except Exception as e:
         return f"爬取热搜时发生了意外（可能是网线被猫叼走了）：{str(e)}"
 
-def set_reminder(minutes: int, task: str):
 
-    # 这个函数返回的消息会立刻发给用户
-    return f"收到。倒计时 {minutes} 分钟：【{task}】。开始计时了，到点我在群里吼你。别到时候 Rush B 没力气！"
+def set_reminder(minutes: float = 0, seconds: float = 0, task: str = "任务", **kwargs):
+    """
+    设置提醒任务。支持显式分钟、秒或混合字符串解析。
+    """
+    total_seconds = 0
+    duration_str = kwargs.get("duration_str", "")
+
+
+    if minutes > 0 or seconds > 0:
+        total_seconds = int(float(minutes) * 60 + float(seconds))
+
+
+    elif duration_str:
+
+        m_match = re.search(r"(\d+\.?\d*)分", duration_str)
+        s_match = re.search(r"(\d+\.?\d*)秒", duration_str)
+
+        m_val = float(m_match.group(1)) if m_match else 0
+        s_val = float(s_match.group(1)) if s_match else 0
+        total_seconds = int(m_val * 60 + s_val)
+
+    if total_seconds <= 0:
+        return "提醒失败：未识别到有效时间，请明确说出时长（如：30秒后提醒我）"
+
+    return f"已设置提醒【{task}】 [SEC:{total_seconds}]【{task}】"
+
+
 def get_weather(city: str):
     try:
 
@@ -76,6 +110,7 @@ def get_weather(city: str):
 
         if response.status_code == 200:
             data = response.json()
+
 
             curr = data['current_condition'][0]
             today = data['weather'][0]
@@ -97,12 +132,13 @@ def get_weather(city: str):
                 f"● 明天预报：{t_desc}，气温 {t_min}℃ ~ {t_max}℃\n"
             )
 
+
             if int(chance_rain) > 50:
-                res += " 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
+                res += "⚠️ 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
             elif int(t_max) > 30:
-                res += " 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
+                res += "🔥 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
             else:
-                res += " 天气还可以，适合下楼吃顿好的补补手感。"
+                res += "✅ 天气还可以，适合下楼吃顿好的补补手感。"
 
             return res
         return f"找不到 {city} 的地图包（数据），你确定这地方在地球上？"
@@ -168,6 +204,7 @@ def simulate_case_opening(case_name: str = "武器箱"):
 
     item = random.choice(skins[grade])
 
+    # 随机加上“StatTrak™”（暗金）属性
     is_stattrak = random.random() < 0.1
     prefix = "StatTrak™ " if is_stattrak else ""
 
@@ -180,6 +217,7 @@ LOCAL_SKILLS_MAP = {
     "get_weather": get_weather,
     "get_weibo_hot_search": get_weibo_hot_search,
     "simulate_case_opening": simulate_case_opening,
+    "set_reminder": set_reminder,  # 之前这里漏掉了！
 }
 
 
@@ -202,16 +240,16 @@ SKILL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询指定城市的实时天气情况",
+            "description": "查询指定城市的实时天气。注意：参数city只需传入城市名（如'日照'），不要带省份前缀。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "city": {
                         "type": "string",
-                        "description": "城市名称，如：北京、上海、哈尔滨"
+                        "description": "城市名称，例如：北京、日照、上海"
                     }
                 },
-                "required": ["city"] # 标记 city 为必填项
+                "required": ["city"]
             }
         }
     },
@@ -219,21 +257,38 @@ SKILL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_weibo_hot_search",
-            "description": "返回微博热搜，这个世界今天有什么好玩的事情发生吗"
+            "description": "返回微博热搜榜单"
         }
     },
     {
         "type": "function",
         "function": {
             "name": "simulate_case_opening",
-            "description": "模拟CSGO开箱"
+            "description": "模拟CSGO武器箱开箱过程",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "case_name": {
+                        "type": "string",
+                        "description": "武器箱名称，默认为'武器箱'"
+                    }
+                }
+            }
         }
     },
     {
         "type": "function",
         "function": {
             "name": "set_reminder",
-            "description": "计时器"
+            "description": "设置一个定时提醒任务",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {"type": "number", "description": "多少分钟后提醒，支持小数如0.5"},
+                    "task": {"type": "string", "description": "提醒内容"}
+                },
+                "required": ["minutes", "task"]
+            }
         }
     }
 ]
