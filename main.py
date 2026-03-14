@@ -1,97 +1,222 @@
 import botpy
-from botpy.message import DirectMessage, Message
+import asyncio
+import re
+import requests
+import os
 from config.settings import QQ_APP_ID, QQ_SECRET
-from config.prompt import CHARACTER_PROMPT
-from core.loop import AgentLoop
-from core.skill_manager import SkillManager
+from core.vector_store import VectorManager
+from core.graph import HerbGraph
 from core.mcp_client import MCPManager
-
-
+from core.skill_manager import SkillManager
+import httpx
+ADMIN_LIST = ["DBFAECCD2C16102A945494949E65C886"]
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 class MyBot(botpy.Client):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.skill_manager = SkillManager()
-        self.mcp_manager = MCPManager()
 
-        self.agent = None
+    def __init__(self, *args, **kwargs):
+
+        super().__init__(*args, **kwargs)
+
+        self.vm = VectorManager()
+        self.mcp = MCPManager()
+        self.sm = SkillManager()
+
+        self.graph = HerbGraph(self.vm, self.mcp, self.sm)
+
         self.history_cache = {}
 
     async def on_ready(self):
-        print(f"机器人「{self.robot.name}」已上线！")
 
-        async def send_reminder_msg(target_id, text):
+        print(f"机器人 {self.robot.name} 已上线")
 
+        asyncio.create_task(self._cleanup_task())
+
+    async def _cleanup_task(self):
+
+        while True:
+            await asyncio.sleep(3600)
+
+            self.vm.delete_expired_docs()
+
+    async def _reminder_timer(self, message, reply, user_id):
+
+        match_sec = re.search(r"\[SEC:(\d+)\]", reply)
+
+        match_task = re.search(r"\[SEC:\d+\]【(.*?)】", reply)
+
+        if not match_sec:
+            return
+        seconds = int(match_sec.group(1))
+        task = match_task.group(1) if match_task else "任务"
+        print(f"[Timer] {seconds}s -> {task}")
+        await asyncio.sleep(seconds)
+        remind = f"🔔 Herb提醒\n该去：{task}"
+        try:
+            await self.api.post_c2c_message(
+                openid=user_id,
+                msg_type=0,
+                content=remind
+            )
+        except:
             try:
-              
-                if len(target_id) > 20:
+                await message.reply(content=remind)
+            except:
+                print("提醒推送失败")
 
-                    await self.api.post_c2c_message(openid=target_id, msg_type=0, content=text)
-                    print(f"[主动推送] 闹钟提醒已发送至个人私聊: {target_id}")
-                else:
-                    await self.api.post_message(channel_id=target_id, content=text)
-                    print(f"[主动推送] 闹钟提醒已发送至频道: {target_id}")
-            except Exception as e:
-                print(f"[!] 主动推送失败，ID: {target_id}，错误: {e}")
+    async def _handle_pdf_and_summarize(self, message, file_url, file_name):
 
-        self.agent = AgentLoop(self.skill_manager, self.mcp_manager, send_message_func=send_reminder_msg)
+        msg_seq = 1
 
-        try:
-            await self.mcp_manager.connect_to_server("npx", ["@modelcontextprotocol/server-everything"])
-            print("[+] 联网服务加载完毕！")
-        except Exception as e:
-            print(f"[!] MCP 加载失败: {e}")
+        user_openid = getattr(message.author, 'user_openid', None) \
+                      or getattr(message.author, 'id', 'unknown')
 
-    async def _handle_all_messages(self, message, source_type):
-        content = message.content.strip()
+        group_openid = getattr(message, 'group_openid', None)
 
-        user_id = getattr(message.author, 'user_openid', None) or getattr(message.author, 'id', 'unknown_user')
-        channel_id = getattr(message, 'channel_id', None) or getattr(message, 'id', None)
-
-        print(f"\n[!!! 捕获到{source_type}消息 !!!] 用户ID: {user_id} 内容: {content}")
-
-        if not content: return
-        if not self.agent: return  # 确保 agent 已在 on_ready 初始化
-
-        if user_id not in self.history_cache:
-            self.history_cache[user_id] = [{"role": "system", "content": CHARACTER_PROMPT}]
+        is_admin = user_openid in ADMIN_LIST
 
         try:
-            print(f"--- Herbbot 正在通过 DeepSeek 思考... ---")
 
+            os.makedirs("./data/temp", exist_ok=True)
+            save_path = f"./data/temp/{file_name}"
 
-            reply, updated_history = await self.agent.run(
-                user_input=content,
-                history=self.history_cache[user_id],
-                user_id=user_id,
-                channel_id=channel_id
+            import httpx
+
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", file_url) as resp:
+
+                    resp.raise_for_status()
+
+                    with open(save_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(8192):
+                            if chunk:
+                                f.write(chunk)
+
+            if not PdfReader:
+                await message.reply(
+                    content="⚠️ 未安装 pypdf",
+                    msg_seq=msg_seq
+                )
+                msg_seq += 1
+                return
+
+            reader = PdfReader(save_path)
+
+            full_text = "\n".join(
+                [p.extract_text() for p in reader.pages if p.extract_text()]
             )
 
-            self.history_cache[user_id] = updated_history[-10:]
+            if not full_text.strip():
+                await message.reply(
+                    content="⚠️ PDF没有可解析文本",
+                    msg_seq=msg_seq
+                )
+                msg_seq += 1
+                return
+
+            # 存入向量库
+            self.vm.add_document(
+                full_text,
+                user_id=user_openid,
+                chat_id=group_openid,
+                is_admin=is_admin,
+                file_name=file_name
+            )
+
+            await message.reply(
+                content=f"📄 《{file_name}》已加入知识库",
+                msg_seq=msg_seq
+            )
+            msg_seq += 1
+
+            # 文档总结
+            summary = await self.graph.gen_llm.ainvoke(
+                f"请用100字总结下面文档：\n\n{full_text[:2000]}"
+            )
+
+            await message.reply(
+                content=f"📑 文档总结：\n{summary.content}",
+                msg_seq=msg_seq
+            )
+            msg_seq += 1
+            os.remove(save_path)
+        except Exception as e:
+            print("[PDF ERROR]:", e)
+            await message.reply(
+                content="❌ PDF处理失败",
+                msg_seq=msg_seq
+            )
+    async def _handle_all_messages(self, message):
+        content = message.content.strip()
+        user_id = getattr(message.author, "user_openid", None) \
+                  or getattr(message.author, "id", "unknown")
+        group_id = getattr(message, "group_openid", None)
+        if hasattr(message, 'attachments') and message.attachments:
+            for attach in message.attachments:
+                if attach.filename.lower().endswith('.pdf'):
+                    asyncio.create_task(self._handle_pdf_and_summarize(message, attach.url, attach.filename))
+            return
+
+        if not content:
+            return
+
+        try:
+
+            reply = await self.graph.run(
+                content,
+                self.history_cache.get(user_id, []),
+                user_id,
+                group_id
+            )
+
             await message.reply(content=reply)
-            print(f"[已回复] {reply}")
+
+            if "[SEC:" in reply:
+                print("[Timer] 检测到提醒:", reply)
+
+                asyncio.create_task(
+                    self._reminder_timer(message, reply, user_id)
+                )
+
+            if user_id not in self.history_cache:
+                self.history_cache[user_id] = []
+
+            self.history_cache[user_id].append({
+                "role": "user",
+                "content": content
+            })
+
+            self.history_cache[user_id].append({
+                "role": "assistant",
+                "content": reply
+            })
+
+            self.history_cache[user_id] = self.history_cache[user_id][-10:]
 
         except Exception as e:
-            print(f"!!! Agent运行报错: {e}")
-            import traceback
-            traceback.print_exc()
-            await message.reply(content="咱就是说，大脑突然短路了，稍等下哈~")
 
-    async def on_direct_message_create(self, message: DirectMessage):
-        await self._handle_all_messages(message, "【频道私聊】")
+            print("Error:", e)
+
+            await message.reply(content="系统出错了")
+
+    async def on_at_message_create(self, message):
+
+        await self._handle_all_messages(message)
 
     async def on_c2c_message_create(self, message):
-        await self._handle_all_messages(message, "【C2C私聊】")
 
-    async def on_at_message_create(self, message: Message):
-        await self._handle_all_messages(message, "【@消息】")
+        await self._handle_all_messages(message)
 
 
 if __name__ == "__main__":
+
     intents = botpy.Intents.default()
-    intents.direct_message = True
+
     intents.public_messages = True
-    if hasattr(intents, 'c2c_group_at_messages'):
-        intents.c2c_group_at_messages = True
+    intents.direct_message = True
 
     client = MyBot(intents=intents)
+
     client.run(appid=QQ_APP_ID, secret=QQ_SECRET)
