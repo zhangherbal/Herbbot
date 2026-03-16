@@ -23,17 +23,34 @@ class MyBot(botpy.Client):
         self.vm = VectorManager()
         self.mcp = MCPManager()
         self.sm = SkillManager()
-
-        self.graph = HerbGraph(self.vm, self.mcp, self.sm)
-
         self.history_cache = {}
 
     async def on_ready(self):
-
         print(f"机器人 {self.robot.name} 已上线")
+        import os
 
-        asyncio.create_task(self._cleanup_task())
+        # 1. 启动 MCP 连接
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        mcp_path = os.path.join(base_path, "node_modules", "@modelcontextprotocol", "server-puppeteer", "dist",
+                                "index.js")
 
+        if os.path.exists(mcp_path):
+            try:
+                await self.mcp.connect_to_server("node", [mcp_path])
+                print("[*] MCP Puppeteer 已连接")
+            except Exception as e:
+                print(f"[!] MCP 启动失败: {e}")
+
+        # 2. 获取合并后的工具列表
+        mcp_tools = await self.mcp.get_tool_schemas()
+        skill_tools = self.sm.get_schemas()
+        all_tools = mcp_tools + skill_tools
+
+        # 3. 正式实例化 HerbGraph
+        from core.graph import HerbGraph  # 建议在这里 import 避免循环引用
+        self.graph = HerbGraph(self.vm, self.mcp, self.sm, all_tools)
+
+        print(f"[*] HerbGraph 初始化完成，加载工具 {len(all_tools)} 个")
     async def _cleanup_task(self):
 
         while True:
@@ -67,58 +84,51 @@ class MyBot(botpy.Client):
                 print("提醒推送失败")
 
     async def _handle_pdf_and_summarize(self, message, file_url, file_name):
-
         msg_seq = 1
-
+        # 提取身份信息
         user_openid = getattr(message.author, 'user_openid', None) \
                       or getattr(message.author, 'id', 'unknown')
-
         group_openid = getattr(message, 'group_openid', None)
-
         is_admin = user_openid in ADMIN_LIST
 
+        save_path = f"./data/temp/{file_name}"
+
         try:
-
             os.makedirs("./data/temp", exist_ok=True)
-            save_path = f"./data/temp/{file_name}"
 
-            import httpx
-
-            async with httpx.AsyncClient(timeout=None) as client:
+            # 1. 异步下载文件
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 async with client.stream("GET", file_url) as resp:
-
                     resp.raise_for_status()
-
                     with open(save_path, "wb") as f:
                         async for chunk in resp.aiter_bytes(8192):
                             if chunk:
                                 f.write(chunk)
 
             if not PdfReader:
-                await message.reply(
-                    content="⚠️ 未安装 pypdf",
-                    msg_seq=msg_seq
-                )
-                msg_seq += 1
+                await message.reply(content="⚠️ 环境未安装 pypdf 库", msg_seq=msg_seq)
                 return
 
+            # 2. 解析 PDF 内容
+            # 注意：PdfReader 对象初始化很快，但 extract_text 较慢
             reader = PdfReader(save_path)
+            pages_text = []
+            for p in reader.pages:
+                t = p.extract_text()
+                if t: pages_text.append(t)
 
-            full_text = "\n".join(
-                [p.extract_text() for p in reader.pages if p.extract_text()]
-            )
+            full_text = "\n".join(pages_text)
 
             if not full_text.strip():
-                await message.reply(
-                    content="⚠️ PDF没有可解析文本",
-                    msg_seq=msg_seq
-                )
-                msg_seq += 1
+                await message.reply(content="⚠️ PDF 解析失败，未找到有效文本内容", msg_seq=msg_seq)
                 return
 
-            # 存入向量库
-            self.vm.add_document(
-                full_text,
+            # 3. 异步执行耗时的向量入库操作 (防止阻塞主循环)
+            # 使用 to_thread 将同步的 add_document 丢到线程池运行
+            print(f"[*] 开始处理文档入库: {file_name}")
+            await asyncio.to_thread(
+                self.vm.add_document,
+                text=full_text,
                 user_id=user_openid,
                 chat_id=group_openid,
                 is_admin=is_admin,
@@ -126,28 +136,32 @@ class MyBot(botpy.Client):
             )
 
             await message.reply(
-                content=f"📄 《{file_name}》已加入知识库",
+                content=f"✅ 《{file_name}》处理完成\n已存入向量库并开启混合检索支持。",
                 msg_seq=msg_seq
             )
             msg_seq += 1
 
-            # 文档总结
-            summary = await self.graph.gen_llm.ainvoke(
-                f"请用100字总结下面文档：\n\n{full_text[:2000]}"
-            )
+            # 4. 文档总结 (调用 LLM)
+            # 截取前 3000 字左右进行总结，确保上下文质量
+            summary_prompt = f"请用100字左右总结以下文档的核心内容：\n\n{full_text[:3000]}"
+            summary = await self.graph.gen_llm.ainvoke(summary_prompt)
 
             await message.reply(
                 content=f"📑 文档总结：\n{summary.content}",
                 msg_seq=msg_seq
             )
-            msg_seq += 1
-            os.remove(save_path)
+
         except Exception as e:
-            print("[PDF ERROR]:", e)
-            await message.reply(
-                content="❌ PDF处理失败",
-                msg_seq=msg_seq
-            )
+            print(f"[PDF ERROR]: {e}")
+            await message.reply(content=f"❌ PDF 处理失败: {str(e)}", msg_seq=msg_seq)
+
+        finally:
+            # 无论成功失败，确保清理临时文件
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                except:
+                    pass
     async def _handle_all_messages(self, message):
         content = message.content.strip()
         user_id = getattr(message.author, "user_openid", None) \
