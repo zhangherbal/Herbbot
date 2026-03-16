@@ -70,6 +70,7 @@ HerbBot 是一款基于 **Model Context Protocol (MCP)** 与 **LangChain** 架�
 <img width="600" height="400" alt="Image" src="https://github.com/user-attachments/assets/5c999171-4d48-4772-8ee7-2f7048f9cf6e" />
 <img width="600" height="400" alt="Image" src="https://github.com/user-attachments/assets/dffa444c-538e-4751-8134-b56f1a40d41f" />
 <img width="600" height="400" alt="Image" src="https://github.com/user-attachments/assets/59fc635d-72b5-4414-ad9e-e3dfdf6a476d" />
+<img width="600" height="400" alt="Image" src="https://github.com/user-attachments/assets/30aad4f4-d297-40d8-b6ac-2fde77fdb84f" />
 ---
 
 > *"Counter-Terrorists Win. Bot is online."*
