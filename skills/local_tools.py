@@ -17,64 +17,56 @@ def daily_quote():
 
 def get_weibo_hot_search():
     """
-    基于网页爬取逻辑的微博热搜查询
+    获取微博热搜 
     """
-    print('************** Herb 正在爬取微博热搜 **************')
+    print('************** Herb 正在同步微博热搜 **************')
 
-
-    header = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh-Hans;q=0.9',
-
-        'Cookie': '这里填入你的Cookie'
+    url = 'https://weibo.com/ajax/side/hotSearch'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://weibo.com/'
     }
-    url = 'https://s.weibo.com/top/summary'
 
     try:
+        # 设置超时，防止机器人卡死
+        response = requests.get(url, headers=headers, timeout=10)
 
-        request = urllib.request.Request(url, headers=header)
-        response = urllib.request.urlopen(request, timeout=10)
+        if response.status_code != 200:
+            return f"微博服务器拒绝了 Herb 的请求 (状态码: {response.status_code})"
 
-
-        if response.info().get('Content-Encoding') == 'gzip':
-            compressed_data = response.read()
-            decompressed_data = gzip.decompress(compressed_data)
-            html = decompressed_data.decode('utf-8')
-        else:
-            html = response.read().decode('utf-8')
-
-
-        soup = BeautifulSoup(html, 'lxml')
-
-        urls_title = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > a')
-        hotness = soup.select('#pl_top_realtimehot > table > tbody > tr > td.td-02 > span')
-
-        if not urls_title:
-            return "热搜包围网太厚了，Herb 没钻进去。可能是 Cookie 过期了或者被微博防火墙挡住了。"
+        json_data = response.json()
+        data = json_data.get('data', {})
 
         news_results = []
 
-        for i in range(min(len(urls_title), 16)):
-            title = urls_title[i].get_text()
+        # 1. 处理置顶/政府热搜
+        hotgov = data.get('hotgov', {})
+        if hotgov:
+            news_results.append(f"🔥 [置顶] {hotgov.get('word')} (官方推广)")
 
-            if i == 0:
-                continue  
+        # 2. 处理实时热搜列表 (取前 15 条)
+        realtime = data.get('realtime', [])
+        for i, item in enumerate(realtime[:15], 1):
+            word = item.get('word', '未知话题')
+            label = item.get('label_name', '')
+            # 有些热搜带热度数值，有些不带
+            num = item.get('num', '---')
 
+            label_str = f" [{label}]" if label else ""
+            news_results.append(f"{i}. {word}{label_str} (热度:{num})")
 
-            hot = hotness[i - 1].get_text() if (i - 1) < len(hotness) else "TOP"
-            news_results.append(f"{len(news_results) + 1}. {title} (热度:{hot})")
+        if not news_results:
+            return "热搜列表竟然是空的？微博可能又在维护了。"
 
-        get_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        content = "【Herb 实时爬取：微博热搜】\n" + "\n".join(news_results)
-        content += f"\n\n更新时间：{get_time}\n看完这些，我还是回竞技场 Rush B 吧。"
+        # 3. 格式化输出
+        get_time = time.strftime('%H:%M:%S', time.localtime())
+        content = "【Herb 实时播报：微博热搜】\n" + "\n".join(news_results)
+        content += f"\n\n更新时间：{get_time}\n吃瓜要紧，Rush B 先等等。"
 
         return content
 
     except Exception as e:
-        return f"爬取热搜时发生了意外（可能是网线被猫叼走了）：{str(e)}"
-
-
+        return f"获取热搜时发生了意外：{str(e)}"
 def set_reminder(minutes: float = 0, seconds: float = 0, task: str = "任务", **kwargs):
     """
     设置提醒任务。支持显式分钟、秒或混合字符串解析。
