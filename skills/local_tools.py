@@ -17,7 +17,7 @@ def daily_quote():
 
 def get_weibo_hot_search():
     """
-    获取微博热搜 
+    获取微博热搜
     """
     print('************** Herb 正在同步微博热搜 **************')
 
@@ -94,49 +94,48 @@ def set_reminder(minutes: float = 0, seconds: float = 0, task: str = "任务", *
     return f"已设置提醒【{task}】 [SEC:{total_seconds}]【{task}】"
 
 
+import requests
+
+
 def get_weather(city: str):
+    # 填入你申请的高德 Key
+    AMAP_KEY = "f7447a99e3b6454ebbb12285dccda1be"
+
     try:
+        clean_city = city.replace("查询", "").strip()
 
-        url = f"https://wttr.in/{city}?format=j1&lang=zh"
-        response = requests.get(url, timeout=10)
+        # 第一步：获取城市 adcode (高德天气需要行政区划代码)
+        geo_url = f"https://restapi.amap.com/v3/geocode/geo?address={clean_city}&key={AMAP_KEY}"
+        geo_resp = requests.get(geo_url, timeout=5).json()
 
-        if response.status_code == 200:
-            data = response.json()
+        if geo_resp.get('status') == '1' and geo_resp.get('geocodes'):
+            adcode = geo_resp['geocodes'][0]['adcode']
+            city_name = geo_resp['geocodes'][0]['formatted_address']
+        else:
+            return f"找不到 【{city}】 的坐标，这地方是不是还没开服？"
 
+        # 第二步：获取实时天气
+        weather_url = f"https://restapi.amap.com/v3/weather/weatherInfo?city={adcode}&key={AMAP_KEY}&extensions=all"
+        w_resp = requests.get(weather_url, timeout=5).json()
 
-            curr = data['current_condition'][0]
-            today = data['weather'][0]
-
-            tomorrow = data['weather'][1]
-            t_desc = tomorrow['hourly'][4]['lang_zh'][0]['value']  # 取中午前后的描述
-            t_max = tomorrow['maxtempC']
-            t_min = tomorrow['mintempC']
-
-            hourly_next = today['hourly'][1]
-            chance_rain = hourly_next['chanceofrain']
+        if w_resp.get('status') == '1' and w_resp.get('forecasts'):
+            f = w_resp['forecasts'][0]
+            cast = f['casts'][0]  # 当天预报
 
             res = (
-                f"【{city}天气深度汇报】\n"
-                f"● 当前：{curr['lang_zh'][0]['value']} {curr['temp_C']}℃ (体感 {curr['FeelsLikeC']}℃)\n"
-                f"● 今日波动：{today['mintempC']}℃ ~ {today['maxtempC']}℃\n"
-                f"● 短期趋势：未来几小时有【{hourly_next['lang_zh'][0]['value']}】，降水概率 {chance_rain}%\n"
+                f"【{city_name} 战况简报】\n"
+                f"● 天气：{cast['dayweather']} 转 {cast['nightweather']}\n"
+                f"● 温度：{cast['nighttemp']}℃ ~ {cast['daytemp']}℃\n"
+                f"● 风力：{cast['daywind']}风 {cast['daypower']}级\n"
                 f"-------------------\n"
-                f"● 明天预报：{t_desc}，气温 {t_min}℃ ~ {t_max}℃\n"
+                f"链路同步成功，Herb 建议：别管几级风，稳住心态就能赢。"
             )
-
-
-            if int(chance_rain) > 50:
-                res += "⚠️ 别怪哥没提醒你，等下出门带把伞，别把键盘淋湿了。"
-            elif int(t_max) > 30:
-                res += "🔥 明天挺热的，建议窝在空调房里打竞技，别出去晒成肉夹馍。"
-            else:
-                res += "✅ 天气还可以，适合下楼吃顿好的补补手感。"
-
             return res
-        return f"找不到 {city} 的地图包（数据），你确定这地方在地球上？"
-    except Exception as e:
-        return f"天气模块寄了，报错原因: {str(e)}"
 
+        return "高德基站断连，这波天气没抓到。"
+
+    except Exception as e:
+        return f"天气模块由于硬件错误寄了: {str(e)}"
 def simulate_case_opening(case_name: str = "武器箱"):
 
     skins = {
