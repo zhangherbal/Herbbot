@@ -99,7 +99,7 @@ import requests
 
 def get_weather(city: str):
     # 填入你申请的高德 Key
-    AMAP_KEY = "f7447a99e3b6454ebbb12285dccda1be"
+    AMAP_KEY = ""
 
     try:
         clean_city = city.replace("查询", "").strip()
