@@ -25,7 +25,7 @@ class AgentState(TypedDict):
     history: List[dict]
     messages: Annotated[List[BaseMessage], operator.add]
     context: str
-    sources: List[str]  # 新增：用于存储检索来源
+    sources: List[str]  
     user_id: str
     chat_id: str
     intent: str
@@ -41,7 +41,6 @@ class HerbGraph:
         self.mcp = mcp_manager
         self.sm = skill_manager
 
-        # --- 记忆管理配置 (进阶逻辑) ---
         self.TRANSCRIPT_DIR = Path("./data/transcripts")
         self.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         self.KEEP_RECENT_TOOLS = 3  # 保留最近3个工具执行原文
@@ -184,10 +183,9 @@ class HerbGraph:
         # 路由判断
         builder.add_conditional_edges(
             "analyze",
-            self._get_router_logic()  # 该函数保持返回 "execute_tool", "retrieve" 或 "generate"
+            self._get_router_logic() 
         )
 
-        # 【关键修改】：执行完直接去生成，不再回analyze推理，节省1次LLM调用
         builder.add_edge("execute_tool", "generate")
         builder.add_edge("retrieve", "generate")
         builder.add_edge("generate", "critique")
