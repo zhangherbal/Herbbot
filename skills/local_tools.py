@@ -179,7 +179,7 @@ def simulate_case_opening(case_name: str = "武器箱"):
             # 概率判定 (参考官方概率)
     if r < 0.0026:
         grade = "金"
-        suffix = "！！！卧槽！张皓博看了直接原地退役！这把刀够你吃一年猪脚饭了！"
+        suffix = "！！！卧槽！donk看了直接原地退役！这把刀够你吃一年猪脚饭了！"
     elif r < 0.0064:
         grade = "红"
         suffix = "隐秘级！红色大货！兄弟你这手气，不去打职业可惜了。"
