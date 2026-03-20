@@ -99,7 +99,7 @@ import requests
 
 def get_weather(city: str):
     # 填入你申请的高德 Key
-    AMAP_KEY = ""
+    AMAP_KEY = "f7447a99e3b6454ebbb12285dccda1be"
 
     try:
         clean_city = city.replace("查询", "").strip()
@@ -201,7 +201,10 @@ def simulate_case_opening(case_name: str = "武器箱"):
 
     return f"【Herb 模拟开箱：{case_name}】\n物品：{prefix}{item}\n品质：{grade}色\n点评：{suffix}"
 
-
+def compact_memory():
+    """当对话历史过长、逻辑复杂或用户要求重置记忆时，调用此工具进行深度总结。"""
+    # 强制触发总结逻辑
+    return "MEM_COMPACT_SIGNAL"
 LOCAL_SKILLS_MAP = {
     "get_current_time": get_current_time,
     "daily_quote": daily_quote,
@@ -209,6 +212,7 @@ LOCAL_SKILLS_MAP = {
     "get_weibo_hot_search": get_weibo_hot_search,
     "simulate_case_opening": simulate_case_opening,
     "set_reminder": set_reminder,  # 之前这里漏掉了！
+    "compact_memory": compact_memory,
 }
 
 
@@ -281,5 +285,14 @@ SKILL_SCHEMAS = [
                 "required": ["minutes", "task"]
             }
         }
+    },
+    {
+
+        "type": "function",
+        "function": {
+            "name": "compact_memory",
+            "description": "【系统指令】当对话历史过长、话题过于混乱或用户要求‘重启’对话时，调用此工具整理记忆。"
+        }
+
     }
 ]
