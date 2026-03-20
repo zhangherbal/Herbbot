@@ -25,7 +25,7 @@ class AgentState(TypedDict):
     history: List[dict]
     messages: Annotated[List[BaseMessage], operator.add]
     context: str
-    sources: List[str]  
+    sources: List[str]  # 新增：用于存储检索来源
     user_id: str
     chat_id: str
     intent: str
@@ -41,6 +41,7 @@ class HerbGraph:
         self.mcp = mcp_manager
         self.sm = skill_manager
 
+        # --- 记忆管理配置 (进阶逻辑) ---
         self.TRANSCRIPT_DIR = Path("./data/transcripts")
         self.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         self.KEEP_RECENT_TOOLS = 3  # 保留最近3个工具执行原文
@@ -183,9 +184,10 @@ class HerbGraph:
         # 路由判断
         builder.add_conditional_edges(
             "analyze",
-            self._get_router_logic() 
+            self._get_router_logic()  # 该函数保持返回 "execute_tool", "retrieve" 或 "generate"
         )
 
+        # 【关键修改】：执行完直接去生成，不再回analyze推理，节省1次LLM调用
         builder.add_edge("execute_tool", "generate")
         builder.add_edge("retrieve", "generate")
         builder.add_edge("generate", "critique")
@@ -301,14 +303,13 @@ class HerbGraph:
             return {
                 "intent": intent,
                 "tool_calls": [],
-                # "messages": []  <- 这里不返回消息，state["messages"] 就不会增加决策过程中的空消息
             }
 
         except Exception as e:
             print(f"❌ Analyze 节点异常: {e}")
             return {"intent": "chat"}
+
     async def execute_tool(self, state: AgentState):
-        # 确保拿到的是最后一条带 tool_calls 的 AI 消息
         last_message = state["messages"][-1]
         if not (isinstance(last_message, AIMessage) and last_message.tool_calls):
             return {"intent": "chat"}
@@ -316,20 +317,44 @@ class HerbGraph:
         tool_messages = []
         outputs = []
 
+        # 标识是否触发了主动压缩
+        triggered_compact = False
+
         for call in last_message.tool_calls:
             try:
-                # MCP 还是本地 Skill 分发
+                # 1. 统一执行入口
                 if call["name"].startswith("puppeteer_"):
                     result = await self.mcp.call_tool(call["name"], call["args"])
                 else:
                     result = await asyncio.to_thread(self.sm.execute, call["name"], call["args"])
 
+                # 2. Layer 3 信号检测
+                if result == "MEM_COMPACT_SIGNAL":
+                    triggered_compact = True
+                    continue  # 信号本身不作为 ToolMessage 展示给用户
+
+                # 3. 正常结果收集
                 outputs.append(str(result))
                 tool_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
             except Exception as e:
                 error_text = f"工具 {call['name']} 执行失败: {e}"
                 outputs.append(error_text)
                 tool_messages.append(ToolMessage(content=error_text, tool_call_id=call["id"]))
+
+        # 4. 如果触发了压缩，执行特殊的返回逻辑
+        if triggered_compact:
+            print("[Graph] Herb 觉得脑子太乱了，触发主动记忆压缩...")
+            # 注意：这里需要传入当前已有的 tool_messages，确保压缩包含本次调用的意图
+            current_full_messages = state["messages"] + tool_messages
+            compacted_messages = await self._auto_compact(current_full_messages)
+
+            return {
+                "messages": compacted_messages,  
+                "context": "Herb 刚刚整理了一下思绪（执行了深度记忆压缩），现在大脑非常清爽。",
+                "intent": "chat",
+                "reply": "呼... 刚才聊得太嗨，脑子有点乱，我刚把记忆整理了一下。咱们继续，刚才说到哪了？"
+            }
 
         return {
             "messages": tool_messages,
