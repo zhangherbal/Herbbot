@@ -46,6 +46,7 @@ class HerbGraph:
         self.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         self.KEEP_RECENT_TOOLS = 3  # 保留最近3个工具执行原文
         self.TOKEN_THRESHOLD = 8000  # 字符数触发总结的阈值
+        self.KEEP_RECENT = 6
 
         self.decision_llm = ChatOpenAI(
             model=MODEL_NAME,
@@ -123,34 +124,35 @@ class HerbGraph:
         return "generate"
 
     async def _auto_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
+        # 修复变量名错误：使用 self.KEEP_RECENT
+        if len(messages) <= self.KEEP_RECENT:
+            return messages
 
-        # Layer 3: Save transcript (保存原始快照用于故障复原)
-        ts = int(time.time())
-        path = self.TRANSCRIPT_DIR / f"transcript_{ts}.jsonl"
-        with open(path, "w", encoding="utf-8") as f:
-            for m in messages:
-                f.write(json.dumps({"type": m.type, "content": m.content}, ensure_ascii=False) + "\n")
+        to_summarize = messages[:-self.KEEP_RECENT]
+        keep_intact = messages[-self.KEEP_RECENT:]
 
-        # Layer 2: LLM Summarization (将长历史压缩为核心记忆)
-        print(f"[*] 对话历史过长，触发 Auto-Compact 机制...")
+        # 这里的打印很有帮助，保留它
+        print(f"[*] 触发压缩：保留最近{len(keep_intact)}条...")
 
-        history_to_summarize = ""
-        for m in messages:
-            prefix = "User" if isinstance(m, HumanMessage) else "AI"
-            history_to_summarize += f"{prefix}: {m.content[:500]}\n"
+        history_text = ""
+        for m in to_summarize:
+            # 增加对 ToolMessage 的简单处理，防止摘要全是 ID
+            role = "User" if isinstance(m, HumanMessage) else "AI"
+            content = m.content[:200] if not isinstance(m, ToolMessage) else "[工具执行结果]"
+            history_text += f"{role}: {content}\n"
 
-        summary_prompt = (
-            "你是一个记忆管理专家。请总结以下对话的核心上下文、用户偏好和待办事项。\n"
-            "要求：极其简练，只保留关键信息，作为后续对话的背景资料。\n\n"
-            f"--- 对话片段 ---\n{history_to_summarize}"
-        )
+        summary_prompt = f"请简练总结以下对话背景：\n{history_text}"
 
-        response = await self.gen_llm.ainvoke(summary_prompt)
-
-        return [
-            SystemMessage(content=f"[System Memory Archive]\n先前对话摘要：{response.content}"),
-            AIMessage(content="我已整理好之前的对话记忆，请继续。")
-        ]
+        try:
+            # 注意这里：用 gen_llm 是对的，因为它不需要 bind_tools
+            response = await self.gen_llm.ainvoke(summary_prompt)
+            return [
+                SystemMessage(content=f"[历史背景摘要]: {response.content}"),
+                *keep_intact
+            ]
+        except Exception as e:
+            print(f"压缩失败: {e}")
+            return messages
 
     def _get_router_logic(self):
 
@@ -166,9 +168,11 @@ class HerbGraph:
             return "generate"
 
         return router_func
+
     def _build_graph(self):
         builder = StateGraph(AgentState)
 
+        # 定义节点
         builder.add_node("analyze", self.analyze)
         builder.add_node("execute_tool", self.execute_tool)
         builder.add_node("retrieve", self.retrieve)
@@ -177,12 +181,14 @@ class HerbGraph:
 
         builder.add_edge(START, "analyze")
 
+        # 路由判断
         builder.add_conditional_edges(
             "analyze",
-            self._get_router_logic()
+            self._get_router_logic()  # 该函数保持返回 "execute_tool", "retrieve" 或 "generate"
         )
 
-        builder.add_edge("execute_tool", "analyze")  # 执行完工具回analyze检查结果
+        # 【关键修改】：执行完直接去生成，不再回analyze推理，节省1次LLM调用
+        builder.add_edge("execute_tool", "generate")
         builder.add_edge("retrieve", "generate")
         builder.add_edge("generate", "critique")
 
@@ -195,20 +201,13 @@ class HerbGraph:
         return builder.compile()
 
     async def analyze(self, state: AgentState):
-
         messages = state["messages"]
         user_input = state["input"].lower()
         current_time = time.strftime('%Y-%m-%d %H:%M:%S')
 
-        has_tool_result = any(isinstance(m, ToolMessage) for m in messages[-3:])
-        if (messages and isinstance(messages[-1], ToolMessage)) or has_tool_result:
-            print("[Graph] ✅ 探测到工具执行结果，准备生成最终回复。")
-            return {
-                "intent": "chat",
-                "tool_calls": [],
-                "critique_feedback": ""
-            }
-
+        # ---------------------------------------------------------
+        # 1. 硬拦截：定时提醒 (set_reminder)
+        # ---------------------------------------------------------
         time_keywords = ["分钟", "秒", "小时", "点", "钟", "半"]
         action_keywords = ["提醒", "闹钟", "叫我", "记得", "定时"]
         if any(tk in user_input for tk in time_keywords) and any(ak in user_input for ak in action_keywords):
@@ -229,9 +228,11 @@ class HerbGraph:
                 "messages": [AIMessage(content=f"没问题，这就定个 {time_val}{unit} 的闹钟。", tool_calls=[tool_call])],
                 "tool_calls": [tool_call]
             }
-
+        # ---------------------------------------------------------
+        # 2. 硬拦截：微博热搜
+        # ---------------------------------------------------------
         if any(kw in user_input for kw in ["热搜", "微博", "瓜"]):
-            print("[Graph] ⚠️ 命中硬编码逻辑：强制触发微博热搜")
+            print("[Graph] ⚠️ 命中硬拦截：强制触发微博热搜")
             tool_call = {
                 "name": "get_weibo_hot_search",
                 "args": {},
@@ -243,32 +244,31 @@ class HerbGraph:
                 "tool_calls": [tool_call]
             }
 
+        # ---------------------------------------------------------
+        # 3. 软决策预备：天气引导
+        # ---------------------------------------------------------
         weather_trigger = any(kw in user_input for kw in ["天气", "气温", "下雨", "多少度", "冷不冷"])
         weather_instruction = ""
         if weather_trigger:
-            print(f"[Graph] 🌤 探测到天气需求，准备引导 LLM 提取城市...")
             weather_instruction = (
-                "\n【紧急任务：天气查询】\n"
-                "1. 你必须调用 'get_weather' 工具。\n"
-                "2. 必须从输入中提取纯净的城市名（如 '日照'、'北京'），严禁包含‘查询’、‘今天’等废词。\n"
-                "3. 如果用户没说城市，请根据上下文推断，严禁直接说查不到。"
+                "\n【紧急任务：天气查询】你必须调用 'get_weather' 工具，提取纯净城市名。"
             )
 
+        # ---------------------------------------------------------
+        # 4. LLM 意图决策
+        # ---------------------------------------------------------
         system_prompt = (
             f"{CHARACTER_PROMPT}\n"
             f"当前时间: {current_time}\n"
-            "【意图判断协议】\n"
-            f"1. 实时信息（天气/提醒）：使用 tool。{weather_instruction}\n"
-            "2. 校园知识（保研/绩点/食堂）：使用 rag。\n"
-            "3. 普通闲聊：使用 chat。\n"
-            "注意：如果涉及时间或天气，必须优先调用工具，不要只用文字回复。"
+            f"判断意图：实时信息(tool){weather_instruction}、校园知识(rag)、闲聊(chat)。"
         )
-
+        # 只取最近6条进行推理，节省Token
         full_messages = [SystemMessage(content=system_prompt)] + messages[-6:]
 
         try:
             res = await self.decision_llm.ainvoke(full_messages)
 
+            # 情况 A：LLM 决定调用工具
             if res.tool_calls:
                 for call in res.tool_calls:
                     if call["name"] == "get_weather":
@@ -276,11 +276,12 @@ class HerbGraph:
                         clean_city = re.sub(r"(查询|天气|今天|明天|现在的|山东|省|市)", "", str(raw_city)).strip()
                         call["args"]["city"] = clean_city if clean_city else "北京"
 
-                print(f"[Graph] LLM 决策成功: {res.tool_calls[0]['name']} -> {res.tool_calls[0]['args']}")
+                print(f"[Graph] LLM 决策调用工具: {res.tool_calls[0]['name']}")
                 return {"intent": "tool", "messages": [res], "tool_calls": res.tool_calls}
 
+            # 情况 B：LLM 漏掉工具但触发了天气硬补齐
             if weather_trigger:
-                print("[Graph] ⚠️ LLM 漏掉工具调用，执行暴力补齐")
+                print("[Graph] ⚠️ LLM 漏掉工具，执行暴力补齐")
                 fallback_city = user_input.replace("查询", "").replace("天气", "").strip()[:2]
                 fallback_city = fallback_city if fallback_city else "北京"
                 tool_call = {
@@ -294,53 +295,48 @@ class HerbGraph:
                     "messages": [AIMessage(content="这就去查查天气。", tool_calls=[tool_call])]
                 }
 
-
+            # 情况 C：闲聊或 RAG（核心优化点：不返回 messages 键）
             rag_keywords = ["保研", "综测", "绩点", "饭卡", "宿舍", "食堂", "挂科", "学分"]
             intent = "rag" if any(k in user_input for k in rag_keywords) else "chat"
 
-            return {"intent": intent, "messages": [res], "tool_calls": []}
+            print(f"[Graph] 决策路径: {intent} (不产生冗余消息)")
+            return {
+                "intent": intent,
+                "tool_calls": [],
+                # "messages": []  <- 这里不返回消息，state["messages"] 就不会增加决策过程中的空消息
+            }
 
         except Exception as e:
             print(f"❌ Analyze 节点异常: {e}")
-            return {"intent": "chat", "messages": [], "tool_calls": []}
+            return {"intent": "chat"}
     async def execute_tool(self, state: AgentState):
+        # 确保拿到的是最后一条带 tool_calls 的 AI 消息
         last_message = state["messages"][-1]
+        if not (isinstance(last_message, AIMessage) and last_message.tool_calls):
+            return {"intent": "chat"}
+
         tool_messages = []
         outputs = []
 
-        if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
-            print("⚠️ 警告：进入 execute_tool 但未检测到工具调用请求")
-            return {"messages": [], "context": "", "intent": "chat"}
-
         for call in last_message.tool_calls:
-            name = call["name"]
-            args = call["args"]
-            print(f"正在执行工具: {name} 参数: {args}")
             try:
-                if name == "set_reminder":
-                    # 确保 duration_str 存在
-                    if "minutes" in args:
-                        args["duration_str"] = f"{args.pop('minutes')}分钟"
-                    elif "duration" in args:
-                        args["duration_str"] = str(args.pop("duration"))
-
-                if name.startswith("puppeteer_"):
-                    result = await self.mcp.call_tool(name, args)
+                # MCP 还是本地 Skill 分发
+                if call["name"].startswith("puppeteer_"):
+                    result = await self.mcp.call_tool(call["name"], call["args"])
                 else:
-                    result = await asyncio.to_thread(self.sm.execute, name, args)
+                    result = await asyncio.to_thread(self.sm.execute, call["name"], call["args"])
 
                 outputs.append(str(result))
                 tool_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
             except Exception as e:
-                error_msg = f"工具执行错误: {e}"
-                print(f"❌ 工具内部错误: {e}")
-                outputs.append(error_msg)
-                tool_messages.append(ToolMessage(content=error_msg, tool_call_id=call["id"]))
+                error_text = f"工具 {call['name']} 执行失败: {e}"
+                outputs.append(error_text)
+                tool_messages.append(ToolMessage(content=error_text, tool_call_id=call["id"]))
 
         return {
             "messages": tool_messages,
             "context": "\n".join(outputs),
-            "intent": "chat"  # 执行完工具后，意图转为聊天
+            "intent": "chat"
         }
     async def retrieve(self,state: AgentState):
         print("[Graph] 正在检索知识库...")
@@ -438,7 +434,11 @@ class HerbGraph:
         if sources and any(f"[{i + 1}]" in final_reply for i in range(len(sources))):
             final_reply += "\n\n📚 参考来源：\n" + "\n".join(sources)
 
-        return {"reply": final_reply}
+        return {
+            "reply": final_reply,
+            "messages": [AIMessage(content=final_reply)],  # 必须把 AI 的回答存回消息流
+            "critique_feedback": ""
+        }
     def _format_weibo_directly(self, tool_result):
         """直接格式化微博热搜结果"""
         lines = tool_result.split('\n')
