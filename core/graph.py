@@ -350,7 +350,7 @@ class HerbGraph:
             compacted_messages = await self._auto_compact(current_full_messages)
 
             return {
-                "messages": compacted_messages,  
+                "messages": compacted_messages,
                 "context": "Herb 刚刚整理了一下思绪（执行了深度记忆压缩），现在大脑非常清爽。",
                 "intent": "chat",
                 "reply": "呼... 刚才聊得太嗨，脑子有点乱，我刚把记忆整理了一下。咱们继续，刚才说到哪了？"
@@ -361,15 +361,55 @@ class HerbGraph:
             "context": "\n".join(outputs),
             "intent": "chat"
         }
-    async def retrieve(self,state: AgentState):
-        print("[Graph] 正在检索知识库...")
-        docs = await asyncio.to_thread(self.vm.query, state["input"], state["user_id"], state["chat_id"], k=5)
 
+    async def retrieve(self, state: AgentState):
+        print(f"[Graph] 🔍 进入检索流程，当前输入: {state['input']}")
+
+        # --- 1. 查询改写 (Query Rewrite) ---
+        history_messages = state.get("messages", [])[-6:]  # 取最近几条消息
+        history_text = ""
+        for m in history_messages:
+            role = "用户" if isinstance(m, HumanMessage) else "AI"
+            history_text += f"{role}: {m.content[:50]}\n"
+
+        rewrite_prompt = (
+            "你是一个搜索关键词优化专家。请根据对话历史和当前问题，提取出 1-2 个最适合在知识库中搜索的专业关键词。"
+            "要求：只需输出关键词，用空格隔开，不要有任何解释文字。\n\n"
+            f"--- 对话历史 ---\n{history_text}"
+            f"--- 当前问题 ---\n{state['input']}"
+        )
+        try:
+            # 使用 gen_llm 进行快速改写
+            rewrite_res = await self.gen_llm.ainvoke(rewrite_prompt)
+            search_query = rewrite_res.content.strip().replace("\"", "").replace("'", "")
+            print(f"[Graph] 🔄 查询改写成功: '{state['input']}' -> '{search_query}'")
+        except Exception as e:
+            print(f"⚠️ 查询改写失败，使用原句兜底: {e}")
+            search_query = state["input"]
+        # --- 2. 调用向量库 (已经是异步混合检索 + RRF + Rerank) ---
+        docs = await self.vm.query(
+            text=search_query,
+            user_id=state["user_id"],
+            chat_id=state["chat_id"],
+            k=6  # 初始召回设定，内部会自动处理 RRF 和 Rerank
+        )
+
+        if not docs:
+            print("[Graph] 知识库未命中任何相关信息")
+            return {
+                "context": "未在校园知识库中找到相关正式记录，建议按一般经验回答或引导用户咨询相关部门。",
+                "sources": []
+            }
+
+        # --- 3. 格式化输出 ---
         context_parts, source_list = [], []
         for i, d in enumerate(docs):
-            source_name = d.metadata.get("source", "未知文档")
+            source_name = d.metadata.get("source", "未知来源")
             source_list.append(f"[{i + 1}] {source_name}")
-            context_parts.append(f"--- 资料 [{i + 1}] ---\n{d.page_content}")
+            # 加上文档标题或来源，方便 LLM 引用
+            context_parts.append(f"【参考资料 {i + 1} | 来源: {source_name}】\n{d.page_content}")
+
+        print(f"[Graph] ✅ 检索完成，共获取 {len(docs)} 条深度上下文")
 
         return {
             "context": "\n\n".join(context_parts),
