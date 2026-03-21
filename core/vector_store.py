@@ -43,6 +43,23 @@ class VectorManager:
         self.bm25_docs = []
         self._load_bm25_from_chroma()
 
+    async def _generate_multi_queries(self, text, llm, count=3):
+        """
+        利用 LLM 生成多个相关的搜索查询
+        """
+        prompt = (
+            f"你是一个搜索专家。请将以下用户问题改写为 {count} 个不同的搜索查询，"
+            f"以便从向量数据库中检索到最相关的答案。每个查询占一行，不要包含编号或解释。\n"
+            f"用户问题：{text}"
+        )
+        try:
+            res = await llm.ainvoke(prompt)
+            # 按行分割并过滤空行
+            queries = [q.strip() for q in res.content.split('\n') if q.strip()]
+            return queries[:count]
+        except Exception as e:
+            print(f"Multi-Query 生成失败: {e}")
+            return [text]  # 失败则返回原句
     def _load_bm25_from_chroma(self):
         all_data = self.vector_store.get(where={"doc_level": "child"})
         if all_data and all_data['documents']:
@@ -183,20 +200,25 @@ class VectorManager:
         print(f"《{file_name}》处理入库完成！")
         return total_count
 
-    async def query(self, text, user_id, chat_id=None, k=10):
+    async def query(self, text, user_id, llm, chat_id=None, k=10):
         """
-        工业级 RAG 检索流程：
-        1. 权限过滤
-        2. 异步并行混合检索 (Vector + BM25)
-        3. RRF 排名融合 (解决分值不可比问题)
-        4. 智谱 Rerank 精排
-        5. 父块回溯内容
+        终极版 RAG 检索流程：
+        1. Multi-Query 生成 (LLM 分身)
+        2. 权限过滤
+        3. 异步并行混合检索 (多路 Vector + 多路 BM25)
+        4. RRF 排名融合 (多路结果大汇总)
+        5. 智谱 Rerank 精排
+        6. 父块回溯内容
         """
         if not self.bm25 or len(self.bm25_docs) == 0:
             self._load_bm25_from_chroma()
 
         try:
-            # --- 1. 权限与隔离过滤 ---
+            # --- 1. 生成多路查询 (Multi-Query) ---
+            queries = await self._generate_multi_queries(text, llm)
+            print(f"[Vector] 🚀 多路查询启动: {queries}")
+
+            # --- 2. 权限与隔离过滤 ---
             current_filter = {
                 "$or": [
                     {"user_id": str(user_id)},
@@ -205,41 +227,60 @@ class VectorManager:
                 ]
             }
 
-            # --- 2. 混合检索 (并行执行提高效率) ---
+            # --- 3. 并行混合检索 ---
             fetch_k = k * 3
-            vec_task = asyncio.to_thread(
-                self.vector_store.similarity_search,
-                text,
-                k=fetch_k,
-                filter=current_filter
-            )
-            tokenized_query = list(jieba.cut(text))
-            bm25_results = self.bm25.get_top_n(tokenized_query, self.bm25_docs, n=fetch_k) if self.bm25 else []
+            vector_tasks = []
+            all_bm25_results = []
 
-            child_vec_docs = await vec_task
+            for q in queries:
+                # 3.1 向量检索任务 (放入 task 列表准备并行)
+                task = asyncio.to_thread(
+                    self.vector_store.similarity_search,
+                    q,
+                    k=fetch_k,
+                    filter=current_filter
+                )
+                vector_tasks.append(task)
 
-            # --- 3. RRF 排名融合 ---
-            combined_children = self._apply_rrf(child_vec_docs, bm25_results)
+                # 3.2 BM25 检索 (内存操作，直接执行)
+                if self.bm25:
+                    tokenized_q = list(jieba.cut(q))
+                    bm25_hits = self.bm25.get_top_n(tokenized_q, self.bm25_docs, n=fetch_k)
+                    all_bm25_results.extend(bm25_hits)
+
+            # 并行执行所有向量检索请求
+            vector_results_lists = await asyncio.gather(*vector_tasks)
+            # 扁平化所有路数的向量结果
+            all_vector_results = [doc for sublist in vector_results_lists for doc in sublist]
+
+            # --- 4. RRF 排名融合 (全路数大汇总) ---
+            # RRF 此时会自动处理：哪些文档在多路查询中都被搜到了，它们的排名会更高
+            combined_children = self._apply_rrf(all_vector_results, all_bm25_results)
 
             if not combined_children:
-                print(f"[Vector] ⚠️ 未找到匹配文档: {text}")
+                print(f"[Vector] ⚠️ 全路数检索均未找到匹配: {text}")
                 return []
-            # --- 4. 智谱 Rerank 精排 ---
+
+            # --- 5. 智谱 Rerank 精排 ---
+            # 依然取前 50 条进行最严苛的打分
             rerank_input = combined_children[:50]
             try:
+                # 精排还是针对原始问题 text 进行相关性计算
                 reranked_children = await self._zhipu_rerank_async(text, rerank_input, top_n=5)
-                print(f"[Vector] Rerank 完成，召回 Top {len(reranked_children)} 个高质量子块")
+                print(f"[Vector] ✅ Rerank 完成，从多路结果中选出 Top {len(reranked_children)}")
             except Exception as e:
-                print(f"[Vector] Rerank 失败，启动降级逻辑: {e}")
+                print(f"[Vector] ⚠️ Rerank 失败，启用降级逻辑: {e}")
                 reranked_children = rerank_input[:5]
-            # --- 5. 父块回溯 (Parent-Child Retrieval) ---
+
+            # --- 6. 父块回溯 (Parent-Child Retrieval) ---
             final_context_docs = []
             seen_parents = set()
             for child in reranked_children:
                 p_id = child.metadata.get("parent_id")
                 target_id = p_id if p_id else child.metadata.get("id")
+
                 if target_id and target_id not in seen_parents:
-                    # 回溯父块获取更完整的上下文
+                    # 并行回溯父块可以进一步优化，此处保持逻辑清晰
                     parent_data = await asyncio.to_thread(
                         self.vector_store.get,
                         where={"id": target_id}
@@ -257,10 +298,12 @@ class VectorManager:
 
                 if len(final_context_docs) >= 4:
                     break
+
             return final_context_docs
+
         except Exception as e:
             import traceback
-            print(f"[Vector]检索链条崩溃:\n{traceback.format_exc()}")
+            print(f"[Vector] 检索链条崩溃:\n{traceback.format_exc()}")
             return []
     def delete_expired_docs(self):
         """清理过期文档"""
