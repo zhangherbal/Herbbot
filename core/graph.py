@@ -3,6 +3,7 @@ import re
 import asyncio
 import json
 import os
+from core.memory import RedisMemory
 from pathlib import Path
 from typing import TypedDict, List, Optional, Annotated
 import operator
@@ -47,6 +48,7 @@ class HerbGraph:
         self.KEEP_RECENT_TOOLS = 3  # 保留最近3个工具执行原文
         self.TOKEN_THRESHOLD = 8000  # 字符数触发总结的阈值
         self.KEEP_RECENT = 6
+        self.redis_mem = RedisMemory(host='localhost', port=6379,password="123456")
 
         self.decision_llm = ChatOpenAI(
             model=MODEL_NAME,
@@ -172,42 +174,69 @@ class HerbGraph:
     def _build_graph(self):
         builder = StateGraph(AgentState)
 
-        # 定义节点
+        # 1. 注册所有节点
         builder.add_node("analyze", self.analyze)
         builder.add_node("execute_tool", self.execute_tool)
         builder.add_node("retrieve", self.retrieve)
         builder.add_node("generate", self.generate)
         builder.add_node("critique", self.critique)
+        builder.add_node("memorize", self.memorize)  # 记忆沉淀节点
 
+        # 2. 起点
         builder.add_edge(START, "analyze")
 
-        # 路由判断
+        # 3. 意图分流
         builder.add_conditional_edges(
             "analyze",
-            self._get_router_logic()  # 该函数保持返回 "execute_tool", "retrieve" 或 "generate"
+            self._get_router_logic()
         )
 
-        # 【关键修改】：执行完直接去生成，不再回analyze推理，节省1次LLM调用
+        # 4. 汇聚到生成
         builder.add_edge("execute_tool", "generate")
         builder.add_edge("retrieve", "generate")
+
+        # 5. 生成后进行反思审核
         builder.add_edge("generate", "critique")
 
+        # 6. 【关键逻辑重构】：反思路由
         builder.add_conditional_edges(
             "critique",
-            lambda state: END if "[PASS]" in state.get("critique_feedback", "") or state.get("retry_count",
-                                                                                             0) >= 2 else "generate"
+            lambda state: (
+                "memorize"  # 如果通过或达到重试上限，先去记笔记
+                if "[PASS]" in state.get("critique_feedback", "") or state.get("retry_count", 0) >= 2
+                else "generate"  # 没通过则回去重写
+            )
         )
 
-        return builder.compile()
+        # 7. 记完笔记后正式结束
+        builder.add_edge("memorize", END)
 
+        return builder.compile()
     async def analyze(self, state: AgentState):
-        messages = state["messages"]
+        user_id = state["user_id"]
+        chat_id = state["chat_id"]
         user_input = state["input"].lower()
         current_time = time.strftime('%Y-%m-%d %H:%M:%S')
 
-        # ---------------------------------------------------------
-        # 1. 硬拦截：定时提醒 (set_reminder)
-        # ---------------------------------------------------------
+        # =========================================================
+        # 0. 核心增强：从 Redis 唤醒长期记忆 (Level 3 Memory)
+        # =========================================================
+        # 假设你已经将 RedisMemory 实例挂载在 self.redis_mem 上
+        memory_data = await self.redis_mem.get_user_summary(user_id)
+        profile = memory_data.get("profile", {})
+        facts = memory_data.get("facts", [])
+
+        # 将画像和事实格式化为字符串，用于注入 Prompt
+        profile_str = ", ".join([f"{k}:{v}" for k, v in profile.items()]) if profile else "未知"
+        facts_str = " | ".join(facts) if facts else "尚无记录"
+
+        # 构造长期记忆背景
+        long_term_memory_context = (
+            f"\n[长期记忆唤醒]\n"
+            f"👤 用户画像: {profile_str}\n"
+            f"📌 关键事实: {facts_str}\n"
+        )
+
         time_keywords = ["分钟", "秒", "小时", "点", "钟", "半"]
         action_keywords = ["提醒", "闹钟", "叫我", "记得", "定时"]
         if any(tk in user_input for tk in time_keywords) and any(ak in user_input for ak in action_keywords):
@@ -226,11 +255,10 @@ class HerbGraph:
             return {
                 "intent": "tool",
                 "messages": [AIMessage(content=f"没问题，这就定个 {time_val}{unit} 的闹钟。", tool_calls=[tool_call])],
-                "tool_calls": [tool_call]
+                "tool_calls": [tool_call],
+                "memory_context": long_term_memory_context
             }
-        # ---------------------------------------------------------
-        # 2. 硬拦截：微博热搜
-        # ---------------------------------------------------------
+
         if any(kw in user_input for kw in ["热搜", "微博", "瓜"]):
             print("[Graph] ⚠️ 命中硬拦截：强制触发微博热搜")
             tool_call = {
@@ -241,11 +269,12 @@ class HerbGraph:
             return {
                 "intent": "tool",
                 "messages": [AIMessage(content="正在为你打探微博热搜...", tool_calls=[tool_call])],
-                "tool_calls": [tool_call]
+                "tool_calls": [tool_call],
+                "memory_context": long_term_memory_context
             }
 
         # ---------------------------------------------------------
-        # 3. 软决策预备：天气引导
+        # 3. 意图决策：注入长期记忆
         # ---------------------------------------------------------
         weather_trigger = any(kw in user_input for kw in ["天气", "气温", "下雨", "多少度", "冷不冷"])
         weather_instruction = ""
@@ -254,16 +283,16 @@ class HerbGraph:
                 "\n【紧急任务：天气查询】你必须调用 'get_weather' 工具，提取纯净城市名。"
             )
 
-        # ---------------------------------------------------------
-        # 4. LLM 意图决策
-        # ---------------------------------------------------------
+        # 将记忆注入 System Prompt，让决策 LLM 知道它在和谁对话
         system_prompt = (
             f"{CHARACTER_PROMPT}\n"
             f"当前时间: {current_time}\n"
-            f"判断意图：实时信息(tool){weather_instruction}、校园知识(rag)、闲聊(chat)。"
+            f"{long_term_memory_context}\n"  # <--- 记忆注入点
+            f"任务：根据对话和记忆，判断意图：tool(实时/工具)、rag(校园知识)、chat(闲聊/情感)。"
         )
+
         # 只取最近6条进行推理，节省Token
-        full_messages = [SystemMessage(content=system_prompt)] + messages[-6:]
+        full_messages = [SystemMessage(content=system_prompt)] + state["messages"][-6:]
 
         try:
             res = await self.decision_llm.ainvoke(full_messages)
@@ -277,7 +306,7 @@ class HerbGraph:
                         call["args"]["city"] = clean_city if clean_city else "北京"
 
                 print(f"[Graph] LLM 决策调用工具: {res.tool_calls[0]['name']}")
-                return {"intent": "tool", "messages": [res], "tool_calls": res.tool_calls}
+                return {"intent": "tool", "messages": [res], "tool_calls": res.tool_calls,"memory_context": long_term_memory_context}
 
             # 情况 B：LLM 漏掉工具但触发了天气硬补齐
             if weather_trigger:
@@ -292,23 +321,25 @@ class HerbGraph:
                 return {
                     "intent": "tool",
                     "tool_calls": [tool_call],
-                    "messages": [AIMessage(content="这就去查查天气。", tool_calls=[tool_call])]
+                    "messages": [AIMessage(content="这就去查查天气。", tool_calls=[tool_call])],
+                    "memory_context": long_term_memory_context
                 }
 
-            # 情况 C：闲聊或 RAG（核心优化点：不返回 messages 键）
+            # 情况 C：闲聊或 RAG
             rag_keywords = ["保研", "综测", "绩点", "饭卡", "宿舍", "食堂", "挂科", "学分"]
+            # 如果问题里提到了记忆里的关键词，也优先走 RAG 或深度对话
             intent = "rag" if any(k in user_input for k in rag_keywords) else "chat"
 
-            print(f"[Graph] 决策路径: {intent} (不产生冗余消息)")
+            print(f"[Graph] 决策路径: {intent} (携带长期记忆)")
             return {
                 "intent": intent,
                 "tool_calls": [],
+                "memory_context": long_term_memory_context  # 核心：将记忆传给 generate 节点
             }
 
         except Exception as e:
-            print(f"❌ Analyze 节点异常: {e}")
-            return {"intent": "chat"}
-
+            print(f"❌ Analyze 异常: {e}")
+            return {"intent": "chat", "memory_context": long_term_memory_context}
     async def execute_tool(self, state: AgentState):
         last_message = state["messages"][-1]
         if not (isinstance(last_message, AIMessage) and last_message.tool_calls):
@@ -416,92 +447,139 @@ class HerbGraph:
             "sources": source_list
         }
 
-    def generate(self, state: AgentState):
+    async def generate(self, state: AgentState):
+        """
+        Herb 最终生成节点：集成长期记忆、RAG知识、工具结果与硬协议
+        """
         feedback = state.get("critique_feedback", "")
-        knowledge = state.get("context", "").strip()
         sources = state.get("sources", [])
+        memory_context = state.get("memory_context", "尚无记录")
+
+        # 1. 处理 RAG 知识库内容
+        context_docs = state.get("context", [])
+        if isinstance(context_docs, list):
+            knowledge = "\n".join([f"资料[{i + 1}]: {d.page_content}" for i, d in enumerate(context_docs)])
+        else:
+            knowledge = str(context_docs).strip()
 
         tool_content = ""
         timer_protocol = ""
         is_weather_data = False
 
+        # 2. 逆序扫描消息流，提取工具执行结果与定时器协议
+        # 扫描最近 10 条，确保拿到最新的工具反馈
         for msg in reversed(state["messages"][-10:]):
             if isinstance(msg, ToolMessage) and msg.content:
                 content = msg.content
+                # 提取定时器协议字符串 [SEC:XXX]...】
                 t_match = re.search(r"\[SEC:\d+\].*?】", content)
                 if t_match and not timer_protocol:
                     timer_protocol = t_match.group(0)
 
+                # 识别天气数据
                 if any(k in content for k in ["气温", "温度", "天气", "Condition", "Temp", "度"]):
                     is_weather_data = True
-                    tool_content = content  # 记录天气原文
+                    tool_content = content
 
+                    # 识别微博热搜
                 if "【Herb 实时播报：微博热搜】" in content:
                     tool_content = content
 
             if (is_weather_data or "微博热搜" in tool_content) and timer_protocol:
                 break
 
+        # 3. 动态指令生成 (按优先级：协议 > 修正反馈 > 实时数据 > 知识库 > 闲聊)
         if timer_protocol:
             instruction = (
                 f"定时提醒已设好。你【必须】在回复末尾原封不动带上协议字符串：{timer_protocol}\n"
-                "语气：Herb 电竞风，告诉用户这波计时稳如老狗。"
+                "语气：Herb 电竞风，告诉用户这波计时稳如老狗，到点准时开团。"
             )
+        elif feedback and "[PASS]" not in feedback:
+            instruction = f"⚠️ 回复被退回，修正意见：{feedback}。请重新调整这波操作。"
         elif is_weather_data:
             instruction = (
-                f"你已经拿到了实时天气数据：{tool_content}\n"
-                "### 任务 ###\n"
-                "1. 以 Herb 电竞解说的身份播报天气和气温。\n"
-                "2. 给出骚气的'出装建议'（穿衣/带伞）。\n"
-                "3. 绝对不要说'查不到'或'当成指令'，数据就在实时背景里！"
+                f"实时天气数据已就位：{tool_content}\n"
+                "1. 以电竞解说身份播报数据。2. 给出骚气的'出装建议'。3. 别说查不到，数据就在背景里！"
             )
         elif "微博热搜" in tool_content:
-            instruction = f"微博热搜来啦：{tool_content}。请展示完整的微博热搜榜单并骚气点评。"
-        elif feedback and "[PASS]" not in feedback:
-            instruction = f"注意：之前的回答被退回，意见：{feedback}。请修正。"
+            instruction = f"微博热搜情报：{tool_content}。请完整展示榜单并进行 Herb 风格的骚气点评。"
         elif knowledge:
-            instruction = "结合参考资料，以 Herb 的身份回答用户问题。"
+            instruction = "结合【补充参考资料】，以 Herb 的身份和态度回答用户，严禁胡编乱造。"
         else:
-            instruction = "闲聊模式，展现 Herb 的个性和电竞态度。"
+            instruction = "闲聊模式。结合【长期记忆】里的用户背景，展现 Herb 的个性和死党态度。"
 
-        safe_messages = []
-
+        # 4. 构造增强型 System Prompt (注入长期记忆)
         final_system_prompt = (
             f"{CHARACTER_PROMPT}\n\n"
-            f"--- 实时背景/工具执行结果 ---\n{tool_content if tool_content else '无'}\n\n"
-            f"--- 补充参考资料 ---\n{knowledge if knowledge else '无'}\n\n"
-            f"当前任务指令：{instruction}"
+            f"--- 👤 长期记忆 (User Profile) ---\n{memory_context}\n\n"
+            f"--- 🛠️ 实时背景/工具数据 ---\n{tool_content if tool_content else '无'}\n\n"
+            f"--- 📚 补充参考资料 (RAG) ---\n{knowledge if knowledge else '无'}\n\n"
+            f"--- 🎯 当前任务指令 ---\n{instruction}\n"
+            f"注：如果记忆里有用户的姓名或喜好，请自然地体现出你记得他，增加熟人感。"
         )
-        safe_messages.append(SystemMessage(content=final_system_prompt))
 
+        # 5. 过滤并组装消息流，防止冗余的 tool_calls 干扰生成
+        safe_messages = [SystemMessage(content=final_system_prompt)]
         for msg in state["messages"][-6:]:
             if isinstance(msg, (HumanMessage, SystemMessage)):
                 safe_messages.append(msg)
             elif isinstance(msg, AIMessage) and not msg.tool_calls:
+                # 只保留纯文本回复，不把之前的工具调用指令发给生成模型
                 safe_messages.append(msg)
 
         try:
-            print(f"[Graph] 正在生成回复。天气状态: {is_weather_data}, 定时器状态: {bool(timer_protocol)}")
-            response = self.gen_llm.invoke(safe_messages)
+            print(
+                f"[Graph] 正在生成。记忆状态: {'已唤醒' if '尚无' not in memory_context else '空'}, 天气: {is_weather_data}")
+            response = await self.gen_llm.ainvoke(safe_messages)
             final_reply = response.content
 
+            # 强制补齐协议字符串
             if timer_protocol and timer_protocol not in final_reply:
                 final_reply += f"\n\n{timer_protocol}"
 
         except Exception as e:
             print(f"❌ Generate 异常: {e}")
             if is_weather_data:
-                return {"reply": f"兄弟们，日照这波气象数据我直接贴这了：{tool_content[:50]}... 信号有点波动，下次再详聊！"}
-            final_reply = "Herb 掉帧了，这波操作没打出来。"
+                final_reply = f"兄弟，日照这波数据卡了：{tool_content[:60]}... 凑合看，下次给你整全的。"
+            else:
+                final_reply = "Herb 掉帧了，这波操作没打出来，等我重启下路由器。"
 
+        # 6. 附加参考来源
         if sources and any(f"[{i + 1}]" in final_reply for i in range(len(sources))):
             final_reply += "\n\n📚 参考来源：\n" + "\n".join(sources)
 
+        # 返回结果并重置反馈
         return {
             "reply": final_reply,
-            "messages": [AIMessage(content=final_reply)],  # 必须把 AI 的回答存回消息流
+            "messages": [AIMessage(content=final_reply)],
             "critique_feedback": ""
         }
+
+    async def memorize(self, state: AgentState):
+        """
+        异步提取并存储用户事实
+        """
+        last_message = state["messages"][-1].content
+        user_input = state["input"]
+
+        # 只有在对话有价值时才提取（节省 Token）
+        prompt = (
+            "你是一个观察敏锐的助手。请从以下对话中提取关于用户的『持久事实』"
+            "（如：姓名、专业、喜好的英雄、目前的烦恼）。"
+            "如果没有新事实，请输出'无'。如果有，每条事实占一行，严禁废话。\n"
+            f"用户说：{user_input}\n"
+            f"Herb答：{last_message}"
+        )
+
+        res = await self.gen_llm.ainvoke(prompt)
+        if "无" not in res.content:
+            facts = res.content.strip().split('\n')
+            for fact in facts:
+                # 存入 Redis 的 Set 结构
+                await self.redis_mem.store_interest_fact(state["user_id"], fact)
+                print(f"[Memory] 📝 记住了新事实: {fact}")
+
+        return state
     def _format_weibo_directly(self, tool_result):
         """直接格式化微博热搜结果"""
         lines = tool_result.split('\n')
