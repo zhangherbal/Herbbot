@@ -1,7 +1,7 @@
 import  requests
 def get_weather(city: str):
     """查询指定城市的实时天气"""
-    AMAP_KEY = "f7447a99e3b6454ebbb12285dccda1be"
+    AMAP_KEY = ""
     try:
         clean_city = city.replace("查询", "").strip()
         geo_url = f"https://restapi.amap.com/v3/geocode/geo?address={clean_city}&key={AMAP_KEY}"
