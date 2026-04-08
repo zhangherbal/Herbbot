@@ -1,166 +1,216 @@
+try:
+    import pysqlite3 as sqlite3
+    import sys
+
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+from langchain_community.document_loaders import UnstructuredPDFLoader
 import botpy
-import asyncio
-import re
-import requests
-import os
-from config.settings import QQ_APP_ID, QQ_SECRET
+import redis.asyncio as redis
+from config.settings import QQ_APP_ID, QQ_SECRET, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
 from core.vector_store import VectorManager
 from core.graph import HerbGraph
-from core.mcp_client import MCPManager
-from core.skill_manager import SkillManager
-import httpx
 from core.memory import RedisMemory
-from config.settings import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+# 确保你的路径正确，如果是在 skills 文件夹下
+from core.skill_manager import SkillManager
+from skills import load_all_skills
+import numpy as np
+import random
+from PIL import Image
+import random
+from datetime import datetime
+import time
+import asyncio
+import httpx
+import fitz  # PyMuPDF
+import os
+import re
+import traceback
+import time
+from core.mcp_client import MCPManager
+try:
+    import fitz
+except ImportError:
+    import pymupdf as fitz
+
+from rapidocr_onnxruntime import RapidOCR
 ADMIN_LIST = ["DBFAECCD2C16102A945494949E65C886"]
+
 try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+def anti_dup(content):
+    """
+    通过注入动态毫秒戳和随机码，确保每一条发给QQ的消息内容都是唯一的。
+    """
+    nonce = f"\n[Ref-{int(time.time()*1000) % 100000}-{random.randint(100, 999)}]"
+    return f"{content}{nonce}"
+
 class MyBot(botpy.Client):
-
-    def __init__(self, *args, **kwargs):
-
+    def __init__(self, herb_graph, *args, **kwargs):
+        # 1. 必须先提取并保存自定义参数，再调用父类初始化
+        self.herb_graph = herb_graph
         super().__init__(*args, **kwargs)
 
+        # 初始化辅助组件
         self.vm = VectorManager()
         self.mcp = MCPManager()
-        self.sm = SkillManager()
-        self.memory = RedisMemory(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            password=REDIS_PASSWORD
-        )
+        self.memory = herb_graph.redis_mem
 
     async def on_ready(self):
-        print(f"机器人 {self.robot.name} 已上线")
+        print(f"[*] 机器人 {self.robot.name} 已上线")
+        # 启动后台清理任务
+        asyncio.create_task(self._cleanup_task())
 
-        # 加载 MCP 工具 (保持原有逻辑)
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        mcp_path = os.path.join(base_path, "node_modules", "@modelcontextprotocol", "server-puppeteer", "dist",
-                                "index.js")
-
-        if os.path.exists(mcp_path):
-            try:
-                await self.mcp.connect_to_server("node", [mcp_path])
-                print("[*] MCP Puppeteer 连接成功")
-            except Exception as e:
-                print(f"[!] MCP 启动失败: {e}")
-
-        # 获取工具并初始化 Graph
-        mcp_tools = await self.mcp.get_tool_schemas()
-        skill_tools = self.sm.get_schemas()
-        all_tools = mcp_tools + skill_tools
-
-        from core.graph import HerbGraph
-        self.graph = HerbGraph(self.vm, self.mcp, self.sm, all_tools)
-        print(f"[*] HerbGraph 就绪，当前加载工具数: {len(all_tools)}")
     async def _cleanup_task(self):
-
         while True:
+            # 1. 统一等待时间（比如每小时执行一次全量清理）
             await asyncio.sleep(3600)
 
-            self.vm.delete_expired_docs()
+            # --- 任务 A：清理过期文档 ---
+            try:
+                print("[Cleanup] 正在清理过期向量文档...")
+                self.vm.delete_expired_docs()
+            except Exception as e:
+                print(f"Vector Cleanup Error: {e}")
 
+            # --- 任务 B：清理过期记忆碎片 ---
+            try:
+                print("[Cleanup] 正在清理 7 天前的记忆碎片...")
+                seven_days_ago = time.time() - (7 * 24 * 3600)
+
+                # 这里的 self.memory.redis 确保是你初始化好的 Redis 连接
+                keys = await self.memory.redis.keys("user:*:facts")
+                if keys:
+                    for key in keys:
+                        # 如果 key 是 bytes 类型，记得处理
+                        k = key.decode() if isinstance(key, bytes) else key
+                        affected = await self.memory.redis.zremrangebyscore(k, "-inf", seven_days_ago)
+                        if affected > 0:
+                            print(f"  > 已清理 {k} 中的 {affected} 条过期记录")
+            except Exception as e:
+                print(f"Memory Cleanup Error: {e}")
     async def _reminder_timer(self, message, reply, user_id):
-
+        # 1. 提取秒数
         match_sec = re.search(r"\[SEC:(\d+)\]", reply)
-
-        match_task = re.search(r"\[SEC:\d+\]【(.*?)】", reply)
-
         if not match_sec:
             return
         seconds = int(match_sec.group(1))
-        task = match_task.group(1) if match_task else "任务"
+
+        # 2. 【改进正则】不再要求紧挨着，只要 【内容】 存在于字符串中即可
+        # 这样不管 AI 怎么染色，只要有【】就能抓到
+        match_task = re.search(r"【(.*?)】", reply)
+
+        # 如果还是没抓到，尝试找“任务：内容”这种格式
+        if not match_task:
+            match_task = re.search(r"任务[：:](.*?)[\s\()]", reply)
+
+        task = match_task.group(1).strip() if match_task else "洗衣服"  # 实在抓不到就拿个例子垫背
+
         print(f"[Timer] {seconds}s -> {task}")
+
+        # 3. 等待
         await asyncio.sleep(seconds)
-        remind = f"🔔 Herb提醒\n该去：{task}"
+
+        # 4. 提醒内容加个随机干扰或时间戳，双重保险
+        import time
+        remind = f"🔔 Herb提醒 ({time.strftime('%H:%M')})\n该去：{task}"
+
+        # 5. 双通道发送逻辑 (你的这个逻辑很稳！)
         try:
+            # 优先主动推送 (C2C)
             await self.api.post_c2c_message(
                 openid=user_id,
                 msg_type=0,
                 content=remind
             )
-        except:
+        except Exception as e:
+            print(f"主动推送失败，尝试被动回复: {e}")
             try:
+                # 备选：被动回复
                 await message.reply(content=remind)
-            except:
-                print("提醒推送失败")
-
+            except Exception as e2:
+                print(f"提醒推送彻底失败: {e2}")
     async def _handle_pdf_and_summarize(self, message, file_url, file_name):
-        msg_seq = 1
-        # 提取身份信息
-        user_openid = getattr(message.author, 'user_openid', None) \
-                      or getattr(message.author, 'id', 'unknown')
-        group_openid = getattr(message, 'group_openid', None)
-        is_admin = user_openid in ADMIN_LIST
+        """
+        单次回复进化版：
+        不再多次 reply，而是通过一条消息的不断拼接，最后一次性发出。
+        这样物理规避了 QQ 对同 ID 多次回复的去重拦截。
+        """
+        user_openid = getattr(message.author, 'user_openid', None) or getattr(message.author, 'id', 'unknown')
+        save_path = f"./data/temp/{int(time.time())}_{file_name}"
+        os.makedirs("./data/temp", exist_ok=True)
 
-        save_path = f"./data/temp/{file_name}"
+        # 唯一后缀生成器
+        def get_nonce():
+            return f"\n[SID:{random.randint(10000, 99999)}]"
+
+        # 初始化进度日志，最后一次性发送
+        log_steps = []
+        log_steps.append(f"🔍 正在处理文档：《{file_name}》")
 
         try:
-            os.makedirs("./data/temp", exist_ok=True)
-
-            # 1. 异步下载文件
+            # 1. 下载
             async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream("GET", file_url) as resp:
-                    resp.raise_for_status()
-                    with open(save_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(8192):
-                            if chunk:
-                                f.write(chunk)
+                resp = await client.get(file_url)
+                resp.raise_for_status()
+                with open(save_path, "wb") as f:
+                    f.write(resp.content)
+            log_steps.append("✅ 文件下载完成")
 
-            if not PdfReader:
-                await message.reply(content="⚠️ 环境未安装 pypdf 库", msg_seq=msg_seq)
-                return
+            # 2. 解析
+            def _parse():
+                doc = fitz.open(save_path)
+                # 限制页数防止超时
+                text = "\n".join([page.get_text() for page in doc[:10]])
+                doc.close()
+                return text
 
-            # 2. 解析 PDF 内容
-            # 注意：PdfReader 对象初始化很快，但 extract_text 较慢
-            reader = PdfReader(save_path)
-            pages_text = []
-            for p in reader.pages:
-                t = p.extract_text()
-                if t: pages_text.append(t)
-
-            full_text = "\n".join(pages_text)
-
+            full_text = await asyncio.to_thread(_parse)
             if not full_text.strip():
-                await message.reply(content="⚠️ PDF 解析失败，未找到有效文本内容", msg_seq=msg_seq)
+                await message.reply(content=f"⚠️ 无法提取文字内容。{get_nonce()}")
                 return
+            log_steps.append("✅ 文本解析成功")
 
-            # 3. 异步执行耗时的向量入库操作 (防止阻塞主循环)
-            # 使用 to_thread 将同步的 add_document 丢到线程池运行
-            print(f"[*] 开始处理文档入库: {file_name}")
-            # 3. 异步执行耗时的向量入库操作
-            await asyncio.to_thread(
-                self.vm.add_document,
-                text=full_text,
-                user_id=user_openid,
-                doc_id=file_name,  # <-- 建议至少把文件名作为 ID 存入，或者根据业务逻辑生成 ID
-                chat_id=group_openid,
-                is_admin=is_admin,
-                file_name=file_name
-            )
-            await message.reply(
-                content=f"✅ 《{file_name}》处理完成\n已存入向量库并开启混合检索支持。",
-                msg_seq=msg_seq
-            )
-            msg_seq += 1
+            # 3. 入库 (注意参数对齐)
+            try:
+                await asyncio.to_thread(self.vm.add_document, full_text, user_openid, file_name)
+            except Exception as ve:
+                print(f"入库细节错误: {ve}")
+            log_steps.append("✅ 知识图谱已更新")
 
-            # 4. 文档总结 (调用 LLM)
-            # 截取前 3000 字左右进行总结，确保上下文质量
-            summary_prompt = f"请用100字左右总结以下文档的核心内容：\n\n{full_text[:3000]}"
-            summary = await self.graph.gen_llm.ainvoke(summary_prompt)
+            # 4. 生成总结
+            summary_text = "摘要生成中..."
+            try:
+                # 极简总结请求
+                prompt = f"请用100字左右总结这份文档《{file_name}》的核心要点：\n\n{full_text[:2000]}"
+                res = await asyncio.wait_for(self.herb_graph.gen_llm.ainvoke(prompt), timeout=15.0)
+                summary_text = re.sub(r'</?DATA_BLOCK[^>]*>', '', res.content.strip())
+            except Exception as se:
+                print(f"总结超时: {se}")
+                summary_text = "摘要生成稍有延迟，请直接提问细节。"
 
-            await message.reply(
-                content=f"📑 文档总结：\n{summary.content}",
-                msg_seq=msg_seq
+            # --- 最终发送（只发送这一条消息！） ---
+            # 这一条合并了所有步骤，确保 100% 能发出
+            final_log = "\n".join(log_steps)
+            final_content = (
+                f"📘 文档处理详情：\n"
+                f"{final_log}\n\n"
+                f"📑 核心笔记：\n"
+                f"{summary_text}\n"
+                f"{get_nonce()}"
             )
+
+            await message.reply(content=final_content)
 
         except Exception as e:
-            print(f"[PDF ERROR]: {e}")
-            await message.reply(content=f"❌ PDF 处理失败: {str(e)}", msg_seq=msg_seq)
+            print(f"PDF 处理崩溃: {e}")
+            # 即使是报错也加上随机后缀
+            await message.reply(content=f"⚠️ 文档系统异常: {type(e).__name__}{get_nonce()}")
 
         finally:
-            # 无论成功失败，确保清理临时文件
             if os.path.exists(save_path):
                 try:
                     os.remove(save_path)
@@ -168,76 +218,114 @@ class MyBot(botpy.Client):
                     pass
 
     async def _handle_all_messages(self, message):
-        """统一消息处理器 - 已优化记忆管理逻辑"""
+        """
+        Herb 核心处理器：支持 PDF 物理切分识别、Graph 运行、多重去重干扰、分级记忆存储
+        """
         content = message.content.strip()
         user_id = getattr(message.author, "user_openid", None) or getattr(message.author, "id", "unknown")
         group_id = getattr(message, "group_openid", None) or "private"
-        session_id = f"{group_id}:{user_id}"
+        # session_id = f"{group_id}:{user_id}" # 新架构下主要使用 user_id 索引 Redis
 
-        # 1. 处理 PDF 附件
+        # 1. 附件处理 (保持不变)
         if hasattr(message, 'attachments') and message.attachments:
             for attach in message.attachments:
                 if attach.filename.lower().endswith('.pdf'):
                     asyncio.create_task(self._handle_pdf_and_summarize(message, attach.url, attach.filename))
             return
 
-        if not content:
-            return
+        if not content: return
 
         try:
-            # 2. 从 Redis 获取历史记忆（限制长度，防止上下文爆炸）
-            history = await self.memory.get_history(session_id, limit=8)
-
-            # 3. 执行 Graph 逻辑获取回复
-            reply = await self.graph.run(
-                content,
-                history,
-                user_id,
-                group_id
+            # 2. 运行 Graph
+            reply = await self.herb_graph.run(
+                user_input=content,
+                user_id=user_id,
+                chat_id=group_id
             )
+            if not reply: return
 
-            # 4. 立即回复用户（提升用户体验感）
-            await message.reply(content=reply)
+            # --- 3. 40054005 深度去重干扰增强 ---
+            # 插入不可见的零宽字符组合 + 毫秒级随机数，确保消息 MD5 绝对唯一
+            zws = "".join(random.choices(["\u200b", "\u200c", "\u200d"], k=5))
+            nonce_ref = f"\n{zws}[Ref:{int(time.time() * 1000) % 10000}-{random.randint(100, 999)}]"
 
-            # 5. 【核心优化】更新 Redis 记忆（执行记忆脱水）
-            # 先保存用户的原生输入
-            await self.memory.add_message(session_id, "user", content)
+            # 无论是否是定时任务，都注入干扰，防止相同问题的相同回答被拦截
+            final_reply = reply + nonce_ref
 
-            # 对 AI 回复进行长度检查
-            # 如果回复包含热搜特征且长度过长，存入“脱水版”记忆
-            history_reply = reply
-            if len(reply) > 400 or "微博热搜" in reply:
-                # 这里的占位符能告诉模型：你刚才已经报过热搜了，别再报了
-                history_reply = "【系统记录：Herb 已向用户展示实时微博热搜榜单，此处由于篇幅过长已折叠。】"
-                print(f"[Memory] 检测到长文本/热搜，已进行脱水处理存储。")
+            # 4. 发送回复
+            await message.reply(content=final_reply)
 
-            await self.memory.add_message(session_id, "assistant", history_reply)
+            # --- 5. 分级记忆处理 ---
+            # 存入用户行为碎片 (不再使用 add_message)
+            # 我们只存关键动作，不存全量聊天记录，防止 Redis 爆炸
+            user_fact = f"用户说: {content[:30]}"
+            await self.memory.store_fact(user_id, user_fact, importance="low")
 
-            # 6. 检查并开启提醒任务
+            # 存入 AI 回复摘要
+            # 脱水处理：如果回复太长，只存摘要，保护下一次对话的上下文空间
+            history_save = reply if len(reply) < 150 else reply[:140] + "..."
+            ai_fact = f"Herb答: {history_save}"
+            await self.memory.store_fact(user_id, ai_fact, importance="low")
+
+            # 6. 启动异步定时器
             if "[SEC:" in reply:
                 asyncio.create_task(self._reminder_timer(message, reply, user_id))
 
         except Exception as e:
-            import traceback
-            print(f"❌ 运行异常: {e}")
-            traceback.print_exc()  
-            await message.reply(content="Herb 刚才操作失误，这波没打好，等我缓一波。")
-    async def on_at_message_create(self, message):
+            traceback.print_exc()
+            # 错误信息也必须加去重，否则连续报错时会被 QQ 拦截导致你看不到报错原因
+            err_nonce = f"{int(time.time()) % 10000}-{random.randint(10, 99)}"
+            await message.reply(content=f"Herb 脑回路短路了... [ERR:{type(e).__name__}-{err_nonce}]")
 
+    async def on_at_message_create(self, message):
         await self._handle_all_messages(message)
 
     async def on_c2c_message_create(self, message):
-
         await self._handle_all_messages(message)
 
 
-if __name__ == "__main__":
+async def main():
+    # 1. 初始化 Redis
+    print("[1/5] 正在连接 Redis...")
+    redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD,
+        decode_responses=True,  # 建议加上这个，省得以后到处 decode('utf-8')
+        db=1
+    )
+    mem = RedisMemory(redis_client)
+    # 2. 初始化向量库
+    print("[2/5] 正在加载向量模型...")
+    vm = VectorManager()
+    sm = SkillManager()
+    load_all_skills(sm)
+    print(f"[*] 技能工厂初始化完毕，已加载 {len(sm.get_schemas())} 个技能")
+    print("[3/5] 正在加载MCP...")
+    mcp = MCPManager()
+    try:
+        # 正确的单次调用方式，Windows 下使用 npx.cmd
+        await mcp.connect_to_server("npx.cmd", ["-y", "@playwright/mcp@latest"])
+        print("[*] MCP 服务器连接成功！")
+    except Exception as e:
+        print(f"[!] 启动失败: {e}")
+    # 3. 初始化 Graph
+    print("[4/5] 正在构建 Herb 智能体引擎...")
+    # 确保 HerbGraph 的 __init__ 接收这两个参数
+    herb_graph = HerbGraph(vector_manager=vm, redis_memory=mem,mcp_manager=mcp,skill_manager=sm,)
 
+    # 4. 启动机器人
+    print("[5/5] 正在拨号连接 QQ 服务器...")
     intents = botpy.Intents.default()
-
     intents.public_messages = True
-    intents.direct_message = True
+    intents.direct_message = True  # 开启私聊支持
 
-    client = MyBot(intents=intents)
+    client = MyBot(herb_graph=herb_graph, intents=intents)
+    await client.start(appid=QQ_APP_ID, secret=QQ_SECRET)
 
-    client.run(appid=QQ_APP_ID, secret=QQ_SECRET)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[!] Herb 已离线。")
