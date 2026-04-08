@@ -12,7 +12,6 @@ from config.settings import QQ_APP_ID, QQ_SECRET, REDIS_HOST, REDIS_PORT, REDIS_
 from core.vector_store import VectorManager
 from core.graph import HerbGraph
 from core.memory import RedisMemory
-# 确保你的路径正确，如果是在 skills 文件夹下
 from core.skill_manager import SkillManager
 from skills import load_all_skills
 import numpy as np
@@ -135,7 +134,6 @@ class MyBot(botpy.Client):
                 print(f"提醒推送彻底失败: {e2}")
     async def _handle_pdf_and_summarize(self, message, file_url, file_name):
         """
-        单次回复进化版：
         不再多次 reply，而是通过一条消息的不断拼接，最后一次性发出。
         这样物理规避了 QQ 对同 ID 多次回复的去重拦截。
         """
