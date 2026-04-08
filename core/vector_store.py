@@ -1,317 +1,280 @@
 import asyncio
 import os
 import re
+import torch
 import time
 import jieba
-import requests
-import functools
 from rank_bm25 import BM25Okapi
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import ZhipuAIEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from config.settings import ZHIPUAI_API_KEY
-import httpx
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-def safe_api_call(retries=3, delay=1.5):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for i in range(retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if i == retries - 1: raise e
-                    print(f"⚠️ API 调用波动 ({e}), 正在进行第 {i + 1} 次指数退避重试...")
-                    time.sleep(delay * (i + 1))
-            return None
-
-        return wrapper
-
-    return decorator
+# 强制离线模式
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_DATASETS_OFFLINE'] = '1'
 
 
 class VectorManager:
     def __init__(self):
-        self.embeddings = ZhipuAIEmbeddings(model="embedding-2", api_key=ZHIPUAI_API_KEY)
+        print("   [Vector] 正在启动 Herb终极召回优化版...")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-zh-v1.5",
+            model_kwargs={'device': 'cuda'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
         self.persist_directory = "./data/chroma_db"
         self.vector_store = Chroma(
             persist_directory=self.persist_directory,
             embedding_function=self.embeddings
         )
+
+        self.reranker_path = "./models/reranker"
+        try:
+            self.reranker_tokenizer = AutoTokenizer.from_pretrained(self.reranker_path, local_files_only=True)
+            self.reranker_model = AutoModelForSequenceClassification.from_pretrained(
+                self.reranker_path, local_files_only=True).to('cuda').eval()
+            print("   [Vector] Reranker 精排就位")
+        except Exception as e:
+            print(f"   [Error] Reranker 缺失: {e}")
+            self.reranker_model = None
+
         self.bm25 = None
         self.bm25_docs = []
         self._load_bm25_from_chroma()
 
-    async def _generate_multi_queries(self, text, llm, count=3):
-        """
-        利用 LLM 生成多个相关的搜索查询
-        """
-        prompt = (
-            f"你是一个搜索专家。请将以下用户问题改写为 {count} 个不同的搜索查询，"
-            f"以便从向量数据库中检索到最相关的答案。每个查询占一行，不要包含编号或解释。\n"
-            f"用户问题：{text}"
-        )
-        try:
-            res = await llm.ainvoke(prompt)
-            # 按行分割并过滤空行
-            queries = [q.strip() for q in res.content.split('\n') if q.strip()]
-            return queries[:count]
-        except Exception as e:
-            print(f"Multi-Query 生成失败: {e}")
-            return [text]  # 失败则返回原句
     def _load_bm25_from_chroma(self):
-        all_data = self.vector_store.get(where={"doc_level": "child"})
-        if all_data and all_data['documents']:
-            self.bm25_docs = [
-                Document(page_content=d, metadata=m)
-                for d, m in zip(all_data['documents'], all_data['metadatas'])
-            ]
-            tokenized_corpus = [list(jieba.cut(doc.page_content)) for doc in self.bm25_docs]
+        data = self.vector_store.get(where={"doc_level": "child"})
+        if data and data['documents']:
+            self.bm25_docs = [Document(page_content=d, metadata=m) for d, m in
+                              zip(data['documents'], data['metadatas'])]
+            tokenized_corpus = [list(jieba.cut(re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', d.page_content))) for d in
+                                self.bm25_docs]
             self.bm25 = BM25Okapi(tokenized_corpus)
 
-    def _apply_rrf(self, vector_docs, bm25_docs, k=60):
+    def add_document(self, text, user_id, file_name="unknown", llm=None):
         """
-        RRF 算法实现
+        针对序号排版的教师简介PDF进行物理隔离切分
         """
-        doc_scores = {}
+        # 1. 基础清理：提取文件名作为默认主题，统一换行符
+        subject_default = re.sub(r'(老师|简介|详情|介绍|\.txt|\.pdf|\.docx)', '', file_name)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
 
-        # 处理向量检索列表
-        for rank, doc in enumerate(vector_docs):
-            # 使用 content 作为唯一标识进行打分
-            content = doc.page_content
-            if content not in doc_scores:
-                doc_scores[content] = {"score": 0, "doc": doc}
-            doc_scores[content]["score"] += 1.0 / (k + rank + 1)
+        # 2. 【核心】物理切分逻辑：匹配 行首数字 + 点 + 空格 (例如 "44. ")
+        # 使用正向预查 (?=\n\d+\.?) 确保分割时不会丢失序号本身
+        teacher_blocks = re.split(r'\n(?=\d+[\.、]?\s)', text)
 
-        # 处理 BM25 检索列表
-        for rank, doc in enumerate(bm25_docs):
-            content = doc.page_content
-            if content not in doc_scores:
-                doc_scores[content] = {"score": 0, "doc": doc}
-            doc_scores[content]["score"] += 1.0 / (k + rank + 1)
-
-        # 按 RRF 分数从高到低排序
-        reranked_results = sorted(
-            doc_scores.values(),
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        # 提取排序后的文档对象
-        return [item["doc"] for item in reranked_results]
-    @safe_api_call(retries=3)
-    async def _zhipu_rerank_async(self, query, docs, top_n=3):
-        if not docs: return []
-
-        url = "https://open.bigmodel.cn/api/paas/v4/rerank"
-        headers = {"Authorization": f"Bearer {ZHIPUAI_API_KEY}"}
-        payload = {
-            "model": "rerank-2",
-            "query": query,
-            "documents": [d.page_content for d in docs],
-            "top_n": top_n
-        }
-
-        async with httpx.AsyncClient() as client:
-            try:
-                # 异步发送请求，不阻塞其他用户
-                response = await client.post(url, headers=headers, json=payload, timeout=10.0)
-                res_data = response.json()
-
-                reranked_docs = []
-                for item in res_data.get("results", []):
-                    reranked_docs.append(docs[item["index"]])
-                return reranked_docs
-            except Exception as e:
-                print(f"Rerank 异步调用失败: {e}")
-                return docs[:top_n]  # 降级逻辑
-
-    def add_document(self, text, user_id, doc_id=None, chat_id=None, is_admin=False, file_name="unknown"):
-        """
-        父子索引入库逻辑：支持长文档切分、权限隔离、分批写入保护
-        """
-        import time
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        from langchain_core.documents import Document
-
-        parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-        child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=40)
-
-
-        parent_docs = parent_splitter.create_documents([text])
+        # 如果没切开（可能第一行没换行符），尝试匹配行首
+        if len(teacher_blocks) <= 1:
+            teacher_blocks = re.split(r'(?<=^)\d+[\.、]?\s', text)
 
         final_to_add = []
+        # 父块（完整档案）和子块（检索片段）的切分器
+        c_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=100)
 
-        u_id_str = str(user_id)
-        c_id_str = str(chat_id) if chat_id else "private"
+        for i, block in enumerate(teacher_blocks):
+            clean_block = block.strip()
+            if len(clean_block) < 20:
+                continue  # 跳过太短的干扰项
 
-        print(f"[*] 正在处理文档: {file_name}, 初始父块数: {len(parent_docs)}")
+            # 3. 提取当前块的真实老师姓名
+            # 匹配模式：数字序号后紧跟的 2-4 个汉字
+            name_match = re.search(r'\d+[\.、]?\s*([\u4e00-\u9fa5]{2,4})', clean_block)
+            current_teacher = name_match.group(1) if name_match else subject_default
 
-        for i, p_doc in enumerate(parent_docs):
-
-            p_id = doc_id if (doc_id and i == 0) else f"{doc_id or int(time.time())}_p_{i}"
-
-            p_doc.metadata = {
-                "id": p_id,
-                "doc_level": "parent",
-                "user_id": u_id_str,
-                "chat_id": c_id_str,
-                "source": file_name,
-                "is_admin": is_admin
-            }
+            # 4. 创建 Parent Document (整份档案)
+            # 即使向量库返回这个，Herb 也能看到这位老师的全部信息（包括末尾的邮箱）
+            p_id = f"{int(time.time())}_t{i}"
+            parent_content = f"【{current_teacher}】的完整教师档案：\n{clean_block}"
+            p_doc = Document(
+                page_content=parent_content,
+                metadata={
+                    "id": p_id,
+                    "doc_level": "parent",
+                    "user_id": str(user_id),
+                    "subject": current_teacher
+                }
+            )
             final_to_add.append(p_doc)
 
-            children = child_splitter.split_documents([p_doc])
-            for j, c_doc in enumerate(children):
-                c_doc.metadata = {
-                    "id": f"{p_id}_c_{j}",
-                    "parent_id": p_id,  # 追溯父块的关键 Key
-                    "doc_level": "child",
-                    "user_id": u_id_str,
-                    "chat_id": c_id_str,
-                    "source": file_name,
-                    "is_admin": is_admin
-                }
-                final_to_add.append(c_doc)
+            # 5. 创建 Child Documents (检索片段)
+            # 强制在每个片段开头注入老师姓名，防止 RAG 检索时“断章取义”
+            child_chunks = c_splitter.split_text(clean_block)
+            for j, chunk in enumerate(child_chunks):
+                child_doc = Document(
+                    page_content=f"教师【{current_teacher}】信息片段：{chunk.strip()}",
+                    metadata={
+                        "id": f"{p_id}_c_{j}",
+                        "parent_id": p_id,
+                        "doc_level": "child",
+                        "user_id": str(user_id),
+                        "subject": current_teacher
+                    }
+                )
+                final_to_add.append(child_doc)
 
-        total_count = len(final_to_add)
+        # 6. 批量存入向量库并刷新 BM25 索引
+        if final_to_add:
+            self.vector_store.add_documents(final_to_add)
+            if hasattr(self, '_load_bm25_from_chroma'):
+                self._load_bm25_from_chroma()
 
-        batch_size = 32
+        return len(final_to_add)
 
-        print(f"[*] 准备分批写入 {total_count} 个片段 (含父子块)...")
+    async def _analyze_intent(self, text, llm):
+        if not llm: return "NORMAL"
+        prompt = (
+            f"分析意图，仅返回标签：NEGATION(否定), AGGREGATION(汇总), MULTI_ATTR(多属性), NORMAL(普通)。\n问题：{text}")
+        try:
+            res = await llm.ainvoke(prompt)
+            tag = res.content.strip().upper()
+            return tag if tag in ["NEGATION", "AGGREGATION", "MULTI_ATTR"] else "NORMAL"
+        except:
+            return "NORMAL"
 
-        for i in range(0, total_count, batch_size):
-            batch = final_to_add[i: i + batch_size]
-            batch_ids = [d.metadata["id"] for d in batch]
-
-            try:
-                self.vector_store.add_documents(batch, ids=batch_ids)
-                if (i + batch_size) % 128 == 0 or (i + batch_size) >= total_count:
-                    print(f"   进度: {min(i + batch_size, total_count)}/{total_count} 已完成")
-
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"批次写入失败 (Index {i}): {str(e)}")
-
-        print("[*] 正在同步 BM25 索引...")
-        self._load_bm25_from_chroma()
-
-        print(f"《{file_name}》处理入库完成！")
-        return total_count
-
-    async def query(self, text, user_id, llm, chat_id=None, k=10):
-        """
-        终极版 RAG 检索流程：
-        1. Multi-Query 生成 (LLM 分身)
-        2. 权限过滤
-        3. 异步并行混合检索 (多路 Vector + 多路 BM25)
-        4. RRF 排名融合 (多路结果大汇总)
-        5. 智谱 Rerank 精排
-        6. 父块回溯内容
-        """
-        if not self.bm25 or len(self.bm25_docs) == 0:
-            self._load_bm25_from_chroma()
+    async def _advanced_query_transform(self, text, intent, llm):
+        """针对不同意图采用不同的改写深度"""
+        if not llm: return [text]
+        if intent == "MULTI_ATTR":
+            prompt = f"请将以下复杂问题拆解为 2 个独立的属性搜索词（例如：既是教授又是博导 -> 教授, 博导）。直接输出词，逗号分隔。\n问题：{text}"
+        elif intent == "NEGATION":
+            prompt = f"这是一个否定逻辑。请提取被排除项以外的所有正向可能属性关键词。例如：不是教授 -> 讲师, 副教授, 研究员。直接输出关键词，逗号分隔。\n问题：{text}"
+        else:
+            prompt = f"请将该问题改写为 2 个适合搜索的短语。直接输出，每行一个。\n问题：{text}"
 
         try:
-            # --- 1. 生成多路查询 (Multi-Query) ---
-            queries = await self._generate_multi_queries(text, llm)
-            print(f"[Vector] 🚀 多路查询启动: {queries}")
+            res = await llm.ainvoke(prompt)
+            lines = res.content.replace(',', '\n').split('\n')
+            return [l.strip() for l in lines if l.strip()] + [text]
+        except:
+            return [text]
 
-            # --- 2. 权限与隔离过滤 ---
-            current_filter = {
-                "$or": [
-                    {"user_id": str(user_id)},
-                    {"chat_id": str(chat_id) if chat_id else "private"},
-                    {"is_admin": True}
-                ]
-            }
 
-            # --- 3. 并行混合检索 ---
-            fetch_k = k * 3
-            vector_tasks = []
-            all_bm25_results = []
+    async def _local_rerank_async(self, query, docs, top_n):
+        if not docs or not self.reranker_model: return docs[:top_n]
+        pairs = [[query, d.page_content] for d in docs]
 
-            for q in queries:
-                # 3.1 向量检索任务 (放入 task 列表准备并行)
-                task = asyncio.to_thread(
-                    self.vector_store.similarity_search,
+        def _inf():
+            with torch.no_grad():
+                inputs = self.reranker_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt',
+                                                 max_length=512).to('cuda')
+                logits = self.reranker_model(**inputs).logits.view(-1).float()
+                return [d for s, d in sorted(zip(logits, docs), key=lambda x: x[0], reverse=True) if s > -4.0]
+
+        return await asyncio.to_thread(_inf)
+
+    async def query(self, text, user_id, llm=None, chat_id=None, k=5):
+        try:
+            # 1. 意图分析（保持不变）
+            intent = await self._analyze_intent(text, llm)
+
+            #：更安全的 User ID 处理 ---
+            # 如果是公共文档查询，建议尝试兼容模式
+            target_user_id = str(user_id)
+            # 这里的 filter 结构如果报错，可以先尝试最简单的单条件测试
+            base_filter = {"user_id": target_user_id}
+
+            # 2. 关键词提炼（这步一定要加，否则原句检索率极低）
+            search_queries = [text]
+            if llm:
+                # 提炼一个纯净的关键词，如 "艾勇"
+                kw_res = await llm.ainvoke(f"提取关键词，只输出词：{text}")
+                kw = kw_res.content.strip()
+                if kw and kw not in search_queries:
+                    search_queries.insert(0, kw)  # 放在最前面优先搜
+
+            v_results = []
+            for q in search_queries:
+                # 修正：如果这里拿不到数据，去掉 filter 试试
+                res = self.vector_store.similarity_search(
                     q,
-                    k=fetch_k,
-                    filter=current_filter
+                    k=20,  # 稍微多拿点给后面排
+                    filter={"user_id": target_user_id}
                 )
-                vector_tasks.append(task)
+                v_results.extend(res)
 
-                # 3.2 BM25 检索 (内存操作，直接执行)
-                if self.bm25:
-                    tokenized_q = list(jieba.cut(q))
-                    bm25_hits = self.bm25.get_top_n(tokenized_q, self.bm25_docs, n=fetch_k)
-                    all_bm25_results.extend(bm25_hits)
+            # 3. BM25 召回（保持不变）
+            b_results = self.bm25.get_top_n(list(jieba.cut(text)), self.bm25_docs, n=40) if self.bm25 else []
 
-            # 并行执行所有向量检索请求
-            vector_results_lists = await asyncio.gather(*vector_tasks)
-            # 扁平化所有路数的向量结果
-            all_vector_results = [doc for sublist in vector_results_lists for doc in sublist]
+            # 4. 融合与精排（去掉那个硬编码的 -4.0 阈值进行测试）
+            combined = self._apply_rrf_with_penalty(v_results, b_results)
 
-            # --- 4. RRF 排名融合 (全路数大汇总) ---
-            # RRF 此时会自动处理：哪些文档在多路查询中都被搜到了，它们的排名会更高
-            combined_children = self._apply_rrf(all_vector_results, all_bm25_results)
+            # 临时调试：如果到这里 combined 还是空的，说明前面的 similarity_search 就没出结果
+            if not combined:
+                print(f"   [Debug] 向量检索和BM25均无结果。当前库总数: {self.vector_store._collection.count()}")
+                # 降权尝试：去掉所有过滤条件的盲搜
+                combined = self.vector_store.similarity_search(text, k=k)
 
-            if not combined_children:
-                print(f"[Vector] ⚠️ 全路数检索均未找到匹配: {text}")
-                return []
+            # 5. 精排 (放宽限制)
+            reranked = await self._local_rerank_async(text, combined[:40], top_n=20)
 
-            # --- 5. 智谱 Rerank 精排 ---
-            # 依然取前 50 条进行最严苛的打分
-            rerank_input = combined_children[:50]
-            try:
-                # 精排还是针对原始问题 text 进行相关性计算
-                reranked_children = await self._zhipu_rerank_async(text, rerank_input, top_n=5)
-                print(f"[Vector] ✅ Rerank 完成，从多路结果中选出 Top {len(reranked_children)}")
-            except Exception as e:
-                print(f"[Vector] ⚠️ Rerank 失败，启用降级逻辑: {e}")
-                reranked_children = rerank_input[:5]
+            # 6. 回溯 Parent (核心防呆设计)
+            final_context, seen_subs = [], set()
+            for doc in (reranked or combined):  # 如果精排挂了，用混合检索保底
+                m = doc.metadata
+                sub = m.get("subject", "unknown")
+                p_id = m.get("parent_id")
 
-            # --- 6. 父块回溯 (Parent-Child Retrieval) ---
-            final_context_docs = []
-            seen_parents = set()
-            for child in reranked_children:
-                p_id = child.metadata.get("parent_id")
-                target_id = p_id if p_id else child.metadata.get("id")
-
-                if target_id and target_id not in seen_parents:
-                    # 并行回溯父块可以进一步优化，此处保持逻辑清晰
-                    parent_data = await asyncio.to_thread(
-                        self.vector_store.get,
-                        where={"id": target_id}
-                    )
-                    if parent_data and parent_data['documents']:
-                        doc = Document(
-                            page_content=parent_data['documents'][0],
-                            metadata=parent_data['metadatas'][0]
-                        )
-                        final_context_docs.append(doc)
-                        seen_parents.add(target_id)
+                if sub not in seen_subs:
+                    # 如果有 parent_id 且是子节点，回溯
+                    if p_id and m.get("doc_level") == "child":
+                        p_res = self.vector_store.get(ids=[p_id])
+                        if p_res and p_res['documents']:
+                            final_context.append(
+                                Document(page_content=p_res['documents'][0], metadata=p_res['metadatas'][0]))
+                        else:
+                            # 如果回溯失败，直接用当前 child 片段，别让它空着
+                            final_context.append(doc)
                     else:
-                        final_context_docs.append(child)
-                        seen_parents.add(target_id)
+                        final_context.append(doc)
 
-                if len(final_context_docs) >= 4:
-                    break
+                    seen_subs.add(sub)
 
-            return final_context_docs
+                if len(final_context) >= k: break
+
+            return final_context
 
         except Exception as e:
             import traceback
-            print(f"[Vector] 检索链条崩溃:\n{traceback.format_exc()}")
+            traceback.print_exc()
             return []
+
+    def _apply_rrf_with_penalty(self, v_docs, b_docs, penalty_word=None, k=60):
+        """带有逻辑降权的混合检索融合算法"""
+        doc_scores = {}
+
+        # 1. 向量得分融合
+        for rank, doc in enumerate(v_docs):
+            content = doc.page_content
+            if content not in doc_scores:
+                doc_scores[content] = {"score": 0.0, "doc": doc}
+            doc_scores[content]["score"] += 1.0 / (k + rank + 1)
+
+        # 2. BM25得分融合 (赋予关键词匹配更高权重)
+        for rank, doc in enumerate(b_docs):
+            content = doc.page_content
+            if content not in doc_scores:
+                doc_scores[content] = {"score": 0.0, "doc": doc}
+            doc_scores[content]["score"] += 1.5 / (k + rank + 1)
+
+        # 3. 【核心补丁】否定词逻辑降权
+        if penalty_word:
+            for content in doc_scores:
+                # 如果文档中包含被排除的词，将其综合得分降低 90%
+                # 这样它不会被“物理删除”，但会排在那些不含此词的文档后面
+                if penalty_word in content:
+                    doc_scores[content]["score"] *= 0.1
+
+        # 4. 排序并返回
+        sorted_results = sorted(doc_scores.values(), key=lambda x: x["score"], reverse=True)
+        return [item["doc"] for item in sorted_results]
+
     def delete_expired_docs(self):
-        """清理过期文档"""
         try:
             current_now = int(time.time())
             expired_data = self.vector_store.get(
-                where={"$and": [{"expired_at": {"$ne": 0}}, {"expired_at": {"$lt": current_now}}]}
-            )
+                where={"$and": [{"expired_at": {"$ne": 0}}, {"expired_at": {"$lt": current_now}}]})
             ids_to_del = expired_data.get('ids', [])
             if ids_to_del:
                 self.vector_store.delete(ids=ids_to_del)
