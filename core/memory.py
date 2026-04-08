@@ -1,54 +1,51 @@
-import redis.asyncio as redis
-import json
 import time
+import json
 
 
 class RedisMemory:
-    def __init__(self, host='localhost', port=6379, db=1, password=''):
-        self.r = redis.Redis(
-            host=host, port=port, password=password, db=db,
-            decode_responses=True,
-            socket_timeout=5.0
-        )
+    def __init__(self, redis_client):
+        self.redis = redis_client
 
-    # --- 1. 对话流管理 (原有逻辑优化) ---
-    async def get_history(self, session_id: str, limit=10):
-        key = f"herb:chat:{session_id}"
-        data = await self.r.lrange(key, -limit, -1)
-        return [json.loads(m) for m in data]
-
-    async def add_message(self, session_id: str, role: str, content: str):
-        key = f"herb:chat:{session_id}"
-        # 增加时间戳，方便后续做时间衰减分析
-        msg = json.dumps({
-            "role": role,
-            "content": content,
-            "ts": int(time.time())
-        }, ensure_ascii=False)
-
-        async with self.r.pipeline() as pipe:
-            await pipe.rpush(key, msg)
-            await pipe.ltrim(key, -50, -1)  # 只保留最近50条，防止 List 无限增长
-            await pipe.expire(key, 86400)
-            await pipe.execute()
-
-    # --- 2. 用户画像管理 (Level 3 基础) ---
-    async def update_user_profile(self, user_id: str, traits: dict):
+    # --- 1. 存储逻辑分级 ---
+    async def store_fact(self, user_id: str, content: str, importance="low"):
         """
-        存入类似: {'name': '张三', 'hero': '李白', 'level': '王者'}
+        importance="high": 存入 Hash (永久画像)
+        importance="low": 存入 ZSet (带时间戳的碎片)
         """
-        key = f"herb:profile:{user_id}"
-        await self.r.hset(key, mapping=traits)
+        if importance == "high":
+            # 这种通常是用户显式要求的，如“记住我叫吴超”
+            # 我们简单以内容前4个字作为 Key
+            await self.redis.hset(f"user:{user_id}:profile", content[:4], content)
+        else:
+            # 这种是自动记录的行为，如“询问了百度”
+            # score 设为当前时间戳，方便按时间清理
+            await self.redis.zadd(f"user:{user_id}:facts", {content: time.time()})
 
+    # --- 2. 读取逻辑分级 ---
     async def get_user_summary(self, user_id: str):
-        """一次性获取画像和近期事实，用于注入 Prompt"""
-        profile = await self.r.hgetall(f"herb:profile:{user_id}")
-        # 获取最近存入的 3 条原子事实
-        facts = await self.r.smembers(f"herb:facts:{user_id}")
-        return {"profile": profile, "facts": list(facts)[:5]}
+        # 提取永久画像
+        profile = await self.redis.hgetall(f"user:{user_id}:profile")
+        # 提取最近的 5 条碎片记忆 (按时间戳倒序)
+        facts = await self.redis.zrevrange(f"user:{user_id}:facts", 0, 4)
 
-    # --- 3. 事实存储 (防止摘要丢失细节) ---
-    async def store_interest_fact(self, user_id: str, fact: str):
-        """存储用户的一个长期兴趣或事实"""
-        key = f"herb:facts:{user_id}"
-        await self.r.sadd(key, fact)
+        return {
+            "profile": profile or {},
+            "facts": [f.decode('utf-8') if isinstance(f, bytes) else f for f in facts]
+        }
+
+    # --- 3. 自动化归纳 (Consolidation) ---
+    async def consolidate_if_needed(self, user_id: str, llm):
+        count = await self.redis.zcard(f"user:{user_id}:facts")
+        if count < 20: return  # 攒够20条再归纳
+
+        # 取出最旧的 20 条
+        old_facts = await self.redis.zrange(f"user:{user_id}:facts", 0, 19)
+        facts_str = "\n".join([f.decode() for f in old_facts])
+
+        prompt = f"你是一个记忆整理员。请将以下琐碎的行为记录归纳为 1 条关于用户偏好的结论：\n{facts_str}"
+        res = await llm.ainvoke(prompt)
+
+        # 存入 profile，并清理掉这 20 条
+        await self.redis.hset(f"user:{user_id}:profile", f"summary_{int(time.time())}", res.content)
+        await self.redis.zremrangebyrank(f"user:{user_id}:facts", 0, 19)
+        print(f"[Memory] 已完成用户 {user_id} 的记忆归纳")
