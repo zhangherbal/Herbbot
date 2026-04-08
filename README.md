@@ -26,7 +26,7 @@ HerbBot 是一款基于 * **LangChain** 架构开发的 QQ 机器人。骚骚的
 ## 未来计划 (Roadmap)
 看OpenClaw代码，看看能不能还原一个HerbClaw。其次有QQ平台的限制，无法完成一些功能，除此之外需要学习agent评测。
 由于SKlls较少，目前调用工具幻觉率极低，但是Skills增多之后的幻觉处理问题，希望在HerbClaw复现中实现。
----
+
 
 ## 📷 运行预览
 <img width="600" height="400" alt="Image" src="https://github.com/user-attachments/assets/f90e1458-2dfc-4a62-afc7-8f0120f50c7a" />
