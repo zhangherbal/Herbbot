@@ -4,7 +4,7 @@
 > **Style Profile:** `CSGO Theme` / `Tactical Assistant`  
 > **Developer:** [Zhangherbal/Github]
 
-HerbBot 是一款基于 * **LangChain** 架构开发的 QQ 机器人。骚骚的。
+HerbBot 是一款基于  **LangGraph** 架构开发的 QQ 机器人。
 
 ---
 
